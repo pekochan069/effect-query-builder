@@ -58,6 +58,9 @@ export interface Column<
   readonly generated: boolean;
 }
 
+export const isColumn = (value: unknown): value is Column =>
+  Predicate.hasProperty(value, ColumnTypeId);
+
 type Columns<
   Name extends QualifiedName,
   Fields extends Schema.Struct.Fields,
