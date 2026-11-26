@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "noEmit": true,
+    "skipLibCheck": false,
+    "strict": true,
+    "types": []
+  },
+  "include": ["type-tests"]
+}
