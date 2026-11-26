@@ -590,6 +590,23 @@ test("keeps whole-row checks on unchanged plain struct inserts", () => {
   expect(Effect.runSync(table.encodeUpdate({ min: 2 }))).toEqual({ min: 2 });
 });
 
+test.each([
+  ["generated", { generated: true }],
+  ["defaulted", { default: "0" }],
+])(
+  "rejects a %s insert field on a struct with a whole-row check",
+  (_, column) => {
+    const schema = Schema.Struct({
+      min: Schema.Int,
+      max: Schema.Int,
+    }).check(Schema.makeFilter(({ min, max }) => min <= max));
+
+    expect(() =>
+      Table.fromSchema("ranges", schema, { columns: { min: column } })
+    ).toThrow(/whole-row checks/iu);
+  }
+);
+
 test("round-trips generated values through physical row codecs", () => {
   const schema = Schema.Struct({
     displayName: Schema.String,
