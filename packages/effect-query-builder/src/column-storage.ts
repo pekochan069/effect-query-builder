@@ -107,7 +107,11 @@ export const inferColumnStorage = (ast: SchemaAST.AST) => {
         part._tag !== "Undefined" &&
         part._tag !== "Never"
     )
-    .map(typeFor);
+    .flatMap((part) =>
+      part._tag === "Enum"
+        ? part.enums.map(([, value]) => typeForLiteral(value))
+        : [typeFor(part)]
+    );
 
   const [first, ...rest] = types;
 
