@@ -26,7 +26,10 @@ export default defineConfig({
       },
     },
     {
-      files: ["packages/effect-query-builder/src/kernel/invariants.ts"],
+      files: [
+        "packages/effect-query-builder/src/column-names.ts",
+        "packages/effect-query-builder/src/kernel/invariants.ts",
+      ],
       rules: { "landmines-style/no-comments": "off" },
     },
   ],

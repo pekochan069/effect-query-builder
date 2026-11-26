@@ -1,1 +1,2 @@
 packages/effect-query-builder/src/kernel/invariants.ts 15 --isolate-assertions --cores=2
+packages/effect-query-builder/src/column-names.ts 15 --isolate-assertions --cores=2
