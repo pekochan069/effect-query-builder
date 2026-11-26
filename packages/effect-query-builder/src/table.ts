@@ -1,4 +1,4 @@
-import { Effect, Predicate, Schema } from "effect";
+import { Effect, Predicate, Schema, Struct } from "effect";
 import { flatMap, forEach } from "effect/Effect";
 import * as Model from "effect/schema/Model";
 import type {
@@ -32,6 +32,12 @@ type Nullable<Encoded> = unknown extends Encoded
     ? true
     : false;
 
+type TableSchema<Name extends QualifiedName> = Name extends QualifiedName
+  ? "schema" extends keyof Name
+    ? Name["schema"]
+    : undefined
+  : never;
+
 const ColumnTypeId = Symbol("effect-query-builder/Column");
 
 export interface Column<
@@ -39,8 +45,9 @@ export interface Column<
   Key extends string = string,
   Field extends Schema.Constraint = Schema.Constraint,
   IsNullable extends boolean = Nullable<Field["Encoded"]>,
+  SchemaName extends QualifiedName["schema"] = TableSchema<Name>,
 > {
-  readonly [ColumnTypeId]: typeof ColumnTypeId;
+  readonly [ColumnTypeId]: SchemaName;
   readonly table: Name;
   readonly key: Key;
   readonly name: string;
@@ -101,19 +108,18 @@ interface NoColumnSettings {
 }
 
 type ColumnSetting<Options, Key extends string | number> = Options extends {
-  readonly columns?: infer Settings;
+  readonly columns: infer Settings;
 }
-  ? Key extends keyof NonNullable<Settings>
-    ? NonNullable<Settings>[Key]
-    : `${Key}` extends keyof NonNullable<Settings>
-      ? NonNullable<Settings>[`${Key}`]
-      : never
-  : never;
+  ? Settings extends Readonly<Record<`${Key}`, infer Setting>>
+    ? string extends keyof Settings
+      ? undefined
+      : number extends keyof Settings
+        ? undefined
+        : Setting
+    : undefined
+  : undefined;
 
-type ColumnOptionsCheck<
-  Fields,
-  Options extends TableOptions,
-> = Options extends {
+type ColumnOptionsCheck<Fields, Options> = Options extends {
   readonly columns: infer Settings;
 }
   ? string extends keyof Settings
@@ -123,38 +129,20 @@ type ColumnOptionsCheck<
       : never
   : unknown;
 
-type MayBeGenerated<Setting> = Setting extends {
-  readonly generated?: infer Generated;
-}
-  ? true extends Generated
-    ? true
-    : false
-  : false;
-
-type MayHaveDefault<Setting> = Setting extends {
-  readonly default?: infer Default;
-}
-  ? Default extends string
-    ? true
-    : false
-  : false;
-
 type WriteFields<
   Fields extends Schema.Struct.Fields,
   Options,
   Update extends boolean,
 > = {
   readonly [
-    Key in KeyOf<Fields> as [ColumnSetting<Options, Key>] extends [never]
-      ? Key
-      : ColumnSetting<Options, Key> extends { readonly generated: true }
-        ? never
-        : Key
+    Key in KeyOf<Fields> as ColumnSetting<Options, Key> extends {
+      readonly generated: true;
+    }
+      ? never
+      : Key
   ]: Update extends true
     ? Schema.optionalKey<Fields[Key]>
-    : true extends
-          | MayBeGenerated<ColumnSetting<Options, Key>>
-          | MayHaveDefault<ColumnSetting<Options, Key>>
+    : ColumnSetting<Options, Key> extends { readonly default: string }
       ? Schema.optionalKey<Fields[Key]>
       : Fields[Key];
 };
@@ -191,10 +179,6 @@ type ModelTableFields<M extends ModelInput> = ModelColumns<
   ModelVariant<"insert", M>,
   ModelVariant<"update", M>
 >;
-
-type OptionalFields<Fields extends Schema.Struct.Fields> = {
-  readonly [Key in keyof Fields]: Schema.optionalKey<Fields[Key]>;
-};
 
 function resolveName<const Name extends TableName>(
   name: Name
@@ -258,7 +242,7 @@ function makeColumns(
       validateIdentifier(name);
 
       return Object.freeze({
-        [ColumnTypeId]: ColumnTypeId,
+        [ColumnTypeId]: table.schema,
         default: column?.default,
         generated: column?.generated ?? false,
         key,
@@ -420,12 +404,9 @@ const makeTable = <
 
   const decode = Schema.decodeUnknownEffect(select);
 
-  const decodeRow: typeof decode = (row, parseOptions) =>
+  const decodeRow = (row: Parameters<typeof decode>[0]) =>
     decode(
-      Predicate.isObject(row)
-        ? remapRow(Object.entries(row), logicalKeys)
-        : row,
-      parseOptions
+      Predicate.isObject(row) ? remapRow(Object.entries(row), logicalKeys) : row
     );
 
   const encode = <SchemaType extends RowSchema>(schema: SchemaType) => {
@@ -457,7 +438,7 @@ const makeTable = <
 
 function writeFields<
   Fields extends Schema.Struct.Fields,
-  Options extends TableOptions,
+  Options extends TableOptions | undefined,
   Update extends boolean,
 >(
   fields: Fields,
@@ -488,21 +469,9 @@ function writeFields(
   return Object.fromEntries(entries);
 }
 
-function optionalFields<Fields extends Schema.Struct.Fields>(
-  fields: Fields
-): OptionalFields<Fields>;
-function optionalFields(fields: Schema.Struct.Fields) {
-  return Object.fromEntries(
-    fieldEntries(fields).map(([key, schema]) => [
-      key,
-      Schema.optionalKey(schema),
-    ])
-  );
-}
-
 function plainInsert<
   Fields extends Schema.Struct.Fields,
-  Options extends TableOptions,
+  Options extends TableOptions | undefined,
 >(
   schema: Schema.Struct<Fields>,
   options: Options | undefined
@@ -563,14 +532,15 @@ const tableFactory = (naming?: ColumnNaming) => ({
   fromSchema<
     const Name extends TableName,
     Fields extends Schema.Struct.Fields,
-    const Options extends TableOptions<NoInfer<ColumnKey<Fields>>> =
-      NoColumnSettings,
+    const Options extends TableOptions<NoInfer<ColumnKey<Fields>>> | undefined =
+      | TableOptions<NoInfer<ColumnKey<Fields>>>
+      | undefined,
   >(
     name: Name,
     schema: Schema.Struct<Fields>,
-    options?: Options &
-      TableOptions<NoInfer<ColumnKey<Fields>>> &
-      ColumnOptionsCheck<Fields, Options>
+    ...[options]:
+      | (undefined extends Options ? [] : never)
+      | [options: Options & ColumnOptionsCheck<Fields, NoInfer<Options>>]
   ) {
     const insert = plainInsert<Fields, Options>(schema, options);
 
@@ -609,7 +579,7 @@ const tableFactory = (naming?: ColumnNaming) => ({
       fields,
       select,
       insert,
-      update.mapFields((updateFields) => optionalFields(updateFields)),
+      update.mapFields(Struct.map(Schema.optionalKey)),
       naming,
       options
     );

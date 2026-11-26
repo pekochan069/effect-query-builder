@@ -19,6 +19,8 @@ import { SqlClient, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
 
 import { Table } from "../src/index.ts";
+import type { TableOptions } from "../src/index.ts";
+import type { QualifiedName } from "../src/kernel/ast.ts";
 
 test("chooses verbatim, factory, table, and explicit column names", () => {
   const schema = Schema.Struct({
@@ -107,6 +109,22 @@ test("derives SQL type and nullability from the encoded schema", () => {
     pg: "BYTEA",
     sqlite: "BLOB",
     mysql: "BLOB",
+  });
+});
+
+test("applies a SQL type override ahead of the inferred dialect type", () => {
+  const { c } = Table.fromSchema(
+    "users",
+    Schema.Struct({ name: Schema.String }),
+    {
+      columns: { name: { sqlType: { pg: "VARCHAR(80)" } } },
+    }
+  );
+
+  expect(c.name.sqlType).toEqual({
+    pg: "VARCHAR(80)",
+    sqlite: "TEXT",
+    mysql: "TEXT",
   });
 });
 
@@ -252,6 +270,45 @@ test("omits generated fields, permits DB defaults on insert, and makes the updat
   });
 });
 
+test("requires insert fields unless their metadata guarantees omission", () => {
+  const schema = Schema.Struct({ title: Schema.String });
+  const options: TableOptions<"title"> = { naming: "snake_case" };
+  const broad = Table.fromSchema("posts", schema, options);
+
+  const dynamic = (generated: boolean, useDefault: boolean) =>
+    Table.fromSchema("posts", schema, {
+      columns: {
+        title: useDefault ? { default: "'Post'", generated } : { generated },
+      },
+    });
+
+  const columns: Readonly<Record<string, { readonly default: string }>> = {};
+  const sparse = Table.fromSchema("posts", schema, { columns });
+
+  const optional = (metadata?: {
+    readonly columns: { readonly title: { readonly default: string } };
+  }) => Table.fromSchema("posts", schema, metadata);
+
+  expectTypeOf<Parameters<typeof broad.encodeInsert>[0]>().toEqualTypeOf<{
+    readonly title: string;
+  }>();
+  expectTypeOf<
+    Parameters<ReturnType<typeof dynamic>["encodeInsert"]>[0]
+  >().toEqualTypeOf<{ readonly title: string }>();
+  expectTypeOf<Parameters<typeof sparse.encodeInsert>[0]>().toEqualTypeOf<{
+    readonly title: string;
+  }>();
+  expectTypeOf<
+    Parameters<ReturnType<typeof optional>["encodeInsert"]>[0]
+  >().toEqualTypeOf<{ readonly title: string }>();
+
+  expect(
+    Effect.runSync(dynamic(false, false).encodeInsert({ title: "Post" }))
+  ).toEqual({
+    title: "Post",
+  });
+});
+
 test("executes and decodes a SQLite statement using the table's physical keys", () => {
   using db = new Database(":memory:");
   db.run("CREATE TABLE users (display_name TEXT NOT NULL)");
@@ -322,6 +379,29 @@ const EncodePrefixService = Context.Service<EncodePrefix, string>(
   "tests/EncodePrefix"
 );
 
+test("decodes projected physical columns without exposing parse options", () => {
+  const table = Table.fromSchema(
+    "users",
+    Schema.Struct({ displayName: Schema.String }),
+    { naming: "snake_case" }
+  );
+
+  expectTypeOf(table.decodeRow).parameters.toEqualTypeOf<[row: unknown]>();
+  expect(
+    Effect.runSync(
+      table.decodeRow({
+        display_name: "Ada",
+        displayName: "ignored",
+        unrelated_column: 2,
+      })
+    )
+  ).toEqual({ displayName: "Ada" });
+  expect(
+    Effect.runSync(Effect.result(table.decodeRow({ displayName: "ignored" })))
+      ._tag
+  ).toBe("Failure");
+});
+
 test("uses and tracks each schema's encoding and decoding services", () => {
   const field = Schema.String.pipe(
     Schema.decodeTo(
@@ -372,6 +452,10 @@ test("brands columns with the table scope, field, type, encoding and nullability
   expectTypeOf(users.c.id).not.toExtend<typeof archive.c.id>();
   expectTypeOf(users.c.id).not.toExtend<typeof users.c.sibling>();
   expectTypeOf(audit.c.id).not.toExtend<typeof live.c.id>();
+  expectTypeOf(audit.c.id).not.toExtend<typeof users.c.id>();
+  expectTypeOf(users.c.id).not.toExtend<typeof audit.c.id>();
+  expectTypeOf(audit.c.id.table).toExtend<QualifiedName>();
+  expectTypeOf(users.c.id.table).toExtend<QualifiedName>();
   expectTypeOf(users.c.id.key).toEqualTypeOf<"id">();
   expectTypeOf<typeof users.c.label.schema.Type>().toEqualTypeOf<
     Option.Option<string>
