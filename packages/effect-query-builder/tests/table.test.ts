@@ -665,6 +665,29 @@ test("keeps whole-row checks on unchanged plain struct inserts", () => {
   expect(Effect.runSync(table.encodeUpdate({ min: 2 }))).toEqual({ min: 2 });
 });
 
+test("keeps whole-row insert checks when an optional field has a database default", () => {
+  const schema = Schema.Struct({
+    amount: Schema.Int,
+    note: Schema.optionalKey(Schema.String),
+  }).check(Schema.makeFilter(({ amount }) => amount > 0));
+
+  const createTable = () =>
+    Table.fromSchema("invoices", schema, {
+      columns: { note: { default: "NULL" } },
+    });
+
+  expect(createTable).not.toThrow();
+
+  const table = createTable();
+  expect(table.insert.fields.note.schema).toBe(schema.fields.note);
+  expect(Effect.runSync(table.encodeInsert({ amount: 1 }))).toEqual({
+    amount: 1,
+  });
+  expect(
+    Effect.runSync(Effect.result(table.encodeInsert({ amount: -1 })))._tag
+  ).toBe("Failure");
+});
+
 test.each([
   ["generated", { generated: true }],
   ["defaulted", { default: "0" }],
