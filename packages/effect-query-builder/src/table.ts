@@ -490,21 +490,30 @@ function plainInsert(
   schema: Schema.Struct<Schema.Struct.Fields>,
   options: TableOptions | undefined
 ) {
-  const changesInsert = Object.values(options?.columns ?? {}).some(
+  const hasWriteMetadata = Object.values(options?.columns ?? {}).some(
     (column) => column?.generated === true || column?.default !== undefined
   );
 
-  if (!changesInsert) {
+  if (!hasWriteMetadata) {
     return schema;
   }
 
-  if (schema.ast.checks !== undefined) {
+  const insertFields = writeFields(schema.fields, options, false);
+
+  if (
+    schema.ast.checks !== undefined &&
+    Object.entries(schema.fields).some(
+      ([key, field]) =>
+        !Object.hasOwn(insertFields, key) ||
+        insertFields[key]?.ast !== field.ast
+    )
+  ) {
     throw new TypeError(
       "Generated columns and database defaults cannot reshape a plain struct insert with whole-row checks"
     );
   }
 
-  return schema.mapFields((fields) => writeFields(fields, options, false));
+  return schema.mapFields(() => insertFields, { unsafePreserveChecks: true });
 }
 
 function modelVariants<M extends ModelInput>(
