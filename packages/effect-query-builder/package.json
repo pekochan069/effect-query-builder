@@ -1,21 +1,61 @@
 {
   "name": "effect-query-builder",
   "version": "0.0.0",
+  "license": "MIT",
+  "author": {
+    "name": "pekochan069",
+    "email": "pekochan069@gmail.com",
+    "url": "https://github.com/pekochan069/effect-query-builder.git"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pekochan069/effect-query-builder.git",
+    "directory": "packages/effect-query-builder"
+  },
   "files": [
-    "src/*.ts",
-    "src/kernel/*.ts"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "type": "module",
   "sideEffects": false,
   "exports": {
-    ".": "./src/index.ts",
-    "./pg": "./src/pg.ts",
-    "./sqlite": "./src/sqlite.ts",
-    "./mysql": "./src/mysql.ts",
-    "./ddl": "./src/ddl.ts"
+    ".": {
+      "default": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./pg": {
+      "default": "./dist/pg.js",
+      "types": "./dist/pg.d.ts"
+    },
+    "./sqlite": {
+      "default": "./dist/sqlite.js",
+      "types": "./dist/sqlite.d.ts"
+    },
+    "./mysql": {
+      "default": "./dist/mysql.js",
+      "types": "./dist/mysql.d.ts"
+    },
+    "./ddl": {
+      "default": "./dist/ddl.js",
+      "types": "./dist/ddl.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build.ts",
+    "check-types": "tsrs --noEmit --fast",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "prepack": "bun run build"
   },
   "devDependencies": {
-    "effect": "^4.0.0"
+    "@types/bun": "^1.4.4",
+    "effect": "^4.0.0",
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "effect": "^4.0.0"
