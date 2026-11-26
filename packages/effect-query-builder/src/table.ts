@@ -484,9 +484,17 @@ function plainInsert(
     (column) => column?.generated === true || column?.default !== undefined
   );
 
-  return changesInsert
-    ? schema.mapFields((fields) => writeFields(fields, options, false))
-    : schema;
+  if (!changesInsert) {
+    return schema;
+  }
+
+  if (schema.ast.checks !== undefined) {
+    throw new TypeError(
+      "Generated columns and database defaults cannot reshape a plain struct insert with whole-row checks"
+    );
+  }
+
+  return schema.mapFields((fields) => writeFields(fields, options, false));
 }
 
 function modelVariants<M extends ModelInput>(
