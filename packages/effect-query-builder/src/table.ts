@@ -499,14 +499,17 @@ function plainInsert(
   }
 
   const insertFields = writeFields(schema.fields, options, false);
+  const { checks, propertySignatures } = schema.ast;
 
   if (
-    schema.ast.checks !== undefined &&
-    Object.entries(schema.fields).some(
-      ([key, field]) =>
-        !Object.hasOwn(insertFields, key) ||
-        insertFields[key]?.ast !== field.ast
-    )
+    checks !== undefined &&
+    (Object.keys(insertFields).length !== propertySignatures.length ||
+      propertySignatures.some(
+        ({ name, type }) =>
+          Predicate.isSymbol(name) ||
+          !Object.hasOwn(insertFields, name) ||
+          insertFields[name]?.ast !== type
+      ))
   ) {
     throw new TypeError(
       "Generated columns and database defaults cannot reshape a plain struct insert with whole-row checks"
