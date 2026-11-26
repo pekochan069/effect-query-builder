@@ -112,6 +112,48 @@ test("derives SQL type and nullability from the encoded schema", () => {
   });
 });
 
+test("infers SQL storage from enum values", () => {
+  const { c } = Table.fromSchema(
+    "jobs",
+    Schema.Struct({
+      status: Schema.NullOr(Schema.Enum({ Pending: "pending", Done: "done" })),
+      priority: Schema.Enum({ Low: 0, High: 1 }),
+      weight: Schema.Enum({ Light: 0.25, Heavy: 0.75 }),
+    })
+  );
+
+  expect(c.status.sqlType).toEqual({
+    pg: "TEXT",
+    sqlite: "TEXT",
+    mysql: "TEXT",
+  });
+  expect(c.status.nullable).toBe(true);
+  expect(c.priority.sqlType).toEqual({
+    pg: "INTEGER",
+    sqlite: "INTEGER",
+    mysql: "INTEGER",
+  });
+  expect(c.weight.sqlType).toEqual({
+    pg: "DOUBLE PRECISION",
+    sqlite: "REAL",
+    mysql: "DOUBLE",
+  });
+});
+
+test("leaves enum storage unspecified for incompatible member types", () => {
+  const { c } = Table.fromSchema(
+    "jobs",
+    Schema.Struct({ status: Schema.Enum({ Pending: "pending", Done: 1 }) }),
+    { columns: { status: { sqlType: { pg: "TEXT" } } } }
+  );
+
+  expect(c.status.sqlType).toEqual({
+    pg: "TEXT",
+    sqlite: undefined,
+    mysql: undefined,
+  });
+});
+
 test("applies a SQL type override ahead of the inferred dialect type", () => {
   const { c } = Table.fromSchema(
     "users",
