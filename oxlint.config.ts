@@ -17,4 +17,10 @@ export default defineConfig({
     ...landmines.jsPlugins,
   ],
   options: { typeAware: true },
+  overrides: [
+    {
+      files: ["packages/effect-query-builder/src/kernel/invariants.ts"],
+      rules: { "landmines-style/no-comments": "off" },
+    },
+  ],
 });
