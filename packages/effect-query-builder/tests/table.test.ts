@@ -312,6 +312,40 @@ test("omits generated fields, permits DB defaults on insert, and makes the updat
   });
 });
 
+test("accepts an unnamed index and distinct composite foreign key targets", () => {
+  const owners = Table.fromSchema(
+    "owners",
+    Schema.Struct({ id: Schema.Int, region: Schema.String }),
+    { primaryKey: ["region", "id"] }
+  );
+
+  const createPosts = () =>
+    Table.fromSchema(
+      "posts",
+      Schema.Struct({ ownerId: Schema.Int, ownerRegion: Schema.String }),
+      {
+        indexes: [{ columns: ["ownerId"] }],
+        foreignKeys: [
+          {
+            columns: ["ownerRegion", "ownerId"],
+            references: [owners.c.region, owners.c.id],
+          },
+        ],
+      }
+    );
+
+  expect(createPosts).not.toThrow();
+  expect(createPosts().constraints).toEqual({
+    indexes: [{ columns: ["ownerId"] }],
+    foreignKeys: [
+      {
+        columns: ["ownerRegion", "ownerId"],
+        references: [owners.c.region, owners.c.id],
+      },
+    ],
+  });
+});
+
 test.each([
   ["empty", ""],
   ["NUL-containing", "posts\0index"],
