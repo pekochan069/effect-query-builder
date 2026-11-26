@@ -312,6 +312,47 @@ test("omits generated fields, permits DB defaults on insert, and makes the updat
   });
 });
 
+test.each([
+  ["empty", ""],
+  ["NUL-containing", "posts\0index"],
+])("rejects %s index names", (_, name) => {
+  expect(() =>
+    Table.fromSchema("posts", Schema.Struct({ id: Schema.Int }), {
+      indexes: [{ columns: ["id"], name }],
+    })
+  ).toThrow(TypeError);
+});
+
+test("rejects repeated physical foreign key target columns", () => {
+  const identifier = { schema: "main", name: "owners" };
+
+  const owners = Table.fromSchema(
+    identifier,
+    Schema.Struct({ id: Schema.Int })
+  );
+
+  const alternateOwners = Table.fromSchema(
+    identifier,
+    Schema.Struct({ ownerId: Schema.Int }),
+    { columns: { ownerId: { name: "id" } } }
+  );
+
+  expect(() =>
+    Table.fromSchema(
+      "posts",
+      Schema.Struct({ ownerId: Schema.Int, editorId: Schema.Int }),
+      {
+        foreignKeys: [
+          {
+            columns: ["ownerId", "editorId"],
+            references: [owners.c.id, alternateOwners.c.ownerId],
+          },
+        ],
+      }
+    )
+  ).toThrow(TypeError);
+});
+
 test("requires insert fields unless their metadata guarantees omission", () => {
   const schema = Schema.Struct({ title: Schema.String });
   const options: TableOptions<"title"> = { naming: "snake_case" };
