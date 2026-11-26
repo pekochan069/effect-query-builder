@@ -528,6 +528,11 @@ function modelFields(select: RowSchema, insert: RowSchema, update: RowSchema) {
   return Object.fromEntries(entries);
 }
 
+const optionalFields: <Fields extends Schema.Struct.Fields>(
+  fields: Fields
+) => { readonly [Key in keyof Fields]: Schema.optionalKey<Fields[Key]> } =
+  Struct.map(Schema.optionalKey);
+
 const tableFactory = (naming?: ColumnNaming) => ({
   fromSchema<
     const Name extends TableName,
@@ -579,7 +584,7 @@ const tableFactory = (naming?: ColumnNaming) => ({
       fields,
       select,
       insert,
-      update.mapFields(Struct.map(Schema.optionalKey)),
+      update.mapFields(optionalFields),
       naming,
       options
     );
