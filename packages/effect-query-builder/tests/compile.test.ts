@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 
-import type { SelectStatement } from "../ast.ts";
-import { compile } from "../compile.ts";
+import type { SelectStatement } from "../src/kernel/ast.ts";
+import { compile } from "../src/kernel/compile.ts";
 
 test("compiles the same select for all three SQL dialects", () => {
   const query: SelectStatement = {

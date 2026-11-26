@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 
-import type { Statement } from "../ast.ts";
-import { compile } from "../compile.ts";
-import type { CompileTarget } from "../compile.ts";
+import type { Statement } from "../src/kernel/ast.ts";
+import { compile } from "../src/kernel/compile.ts";
+import type { CompileTarget } from "../src/kernel/compile.ts";
 
 const insert: Statement = {
   kind: "insert",
