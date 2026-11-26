@@ -1,5 +1,5 @@
 import { Schema } from "effect";
-import { Table } from "effect-query-builder";
+import type { Table } from "effect-query-builder";
 import * as Model from "effect/schema/Model";
 
 class User extends Model.Class<User>("User")({
@@ -7,11 +7,15 @@ class User extends Model.Class<User>("User")({
   active: Model.BooleanSqlite,
 }) {}
 
-const users = Table.fromModel("users", User);
+type Users = ReturnType<typeof Table.fromModel<"users", typeof User>>;
 
-users.encodeUpdate({});
+type Update = Parameters<Users["encodeUpdate"]>[0];
 
-users.encodeUpdate({ active: false });
+type AcceptsUpdate<Input extends Update> = Input;
+
+export type EmptyUpdate = AcceptsUpdate<Record<string, never>>;
+
+export type PartialUpdate = AcceptsUpdate<{ active: false }>;
 
 // @ts-expect-error The update expects a decoded boolean.
-users.encodeUpdate({ active: 0 });
+export type NumericUpdate = AcceptsUpdate<{ active: 0 }>;
