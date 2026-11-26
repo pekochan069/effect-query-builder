@@ -2,7 +2,7 @@
   "name": "effect-query-builder",
   "private": true,
   "workspaces": [
-    "./packages.*"
+    "./packages/*"
   ],
   "type": "module",
   "scripts": {
