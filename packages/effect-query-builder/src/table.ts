@@ -335,6 +335,12 @@ const makeConstraints = <Key extends string>(
           );
         }
 
+        if (hasDuplicateColumnNames(references.map(({ name }) => name))) {
+          throw new TypeError(
+            "Foreign keys must reference distinct columns of the target table"
+          );
+        }
+
         return Object.freeze({
           columns: validate(columns),
           references: copyKeys(references),
@@ -349,9 +355,13 @@ const makeConstraints = <Key extends string>(
 
   if (indexes !== undefined) {
     constraints.indexes = Object.freeze(
-      indexes.map((index) =>
-        Object.freeze({ ...index, columns: validate(index.columns) })
-      )
+      indexes.map((index) => {
+        if (index.name !== undefined) {
+          validateIdentifier(index.name);
+        }
+
+        return Object.freeze({ ...index, columns: validate(index.columns) });
+      })
     );
   }
 
