@@ -1,0 +1,40 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Install Dafny 4.11.0
+        run: |
+          dafny_archive="$RUNNER_TEMP/dafny.zip"
+          curl --fail --silent --show-error --location \
+            https://github.com/dafny-lang/dafny/releases/download/v4.11.0/dafny-4.11.0-x64-ubuntu-22.04.zip \
+            --output "$dafny_archive"
+          echo "a46a9ff7cdd720f7955854c78e95df13f4cfe6b80691b05f8654fe19e8267179  $dafny_archive" | sha256sum --check
+          unzip -q "$dafny_archive" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/dafny" >> "$GITHUB_PATH"
+      - run: bun install --frozen-lockfile
+      - run: bun run check-types
+      - run: bun run check
+      - run: bun test
+      - run: npm install --global lemmascript@0.6.14
+      - run: lsc check --backend=dafny
+      - name: Check Dafny artifacts for drift
+        run: |
+          git diff --exit-code -- '*.dfy' '*.dfy.gen'
+          test -z "$(git ls-files --others --exclude-standard -- '*.dfy' '*.dfy.gen')"

@@ -17,4 +17,17 @@ export default defineConfig({
     ...landmines.jsPlugins,
   ],
   options: { typeAware: true },
+  overrides: [
+    {
+      files: ["packages/effect-query-builder/tests/**/*.test.ts"],
+      rules: {
+        "landmines-structure/colocated-tests": "off",
+        "landmines-structure/test-file-names": "off",
+      },
+    },
+    {
+      files: ["packages/effect-query-builder/src/kernel/invariants.ts"],
+      rules: { "landmines-style/no-comments": "off" },
+    },
+  ],
 });

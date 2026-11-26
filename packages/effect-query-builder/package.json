@@ -1,0 +1,23 @@
+{
+  "name": "effect-query-builder",
+  "version": "0.0.0",
+  "files": [
+    "src/*.ts",
+    "src/kernel/*.ts"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./pg": "./src/pg.ts",
+    "./sqlite": "./src/sqlite.ts",
+    "./mysql": "./src/mysql.ts",
+    "./ddl": "./src/ddl.ts"
+  },
+  "devDependencies": {
+    "effect": "^4.0.0"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
+  }
+}
