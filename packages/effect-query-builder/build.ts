@@ -7,5 +7,5 @@ await Bun.build({
     "./src/ddl.ts",
   ],
   outdir: "./dist",
-  dts: true,
+  packages: "external",
 });

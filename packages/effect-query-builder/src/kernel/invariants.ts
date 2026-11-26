@@ -5,7 +5,7 @@ export type SqlToken =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "bind"; readonly value: unknown };
 
-interface RenderedTokens {
+export interface RenderedTokens {
   readonly sql: string;
   readonly params: readonly unknown[];
 }

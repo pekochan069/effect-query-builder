@@ -46,7 +46,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun build.ts",
+    "build": "tsc --project tsconfig.build.json && bun build.ts",
     "check-types": "tsrs --noEmit --fast",
     "check": "ultracite check",
     "fix": "ultracite fix",
