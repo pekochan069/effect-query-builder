@@ -17,9 +17,10 @@ type BinaryOperator =
   | "*"
   | "/"
   | "AND"
+  | "LIKE"
   | "OR";
 
-export type Expression =
+export type Expression<Raw = never> =
   | {
       readonly kind: "column";
       readonly name: string;
@@ -45,77 +46,107 @@ export type Expression =
   | {
       readonly kind: "binary";
       readonly operator: BinaryOperator;
-      readonly left: Expression;
-      readonly right: Expression;
+      readonly left: Expression<Raw>;
+      readonly right: Expression<Raw>;
     }
   | {
       readonly kind: "not";
-      readonly operand: Expression;
+      readonly operand: Expression<Raw>;
     }
   | {
       readonly kind: "nullCheck";
-      readonly operand: Expression;
+      readonly operand: Expression<Raw>;
       readonly negate?: boolean;
     }
   | {
+      readonly kind: "in";
+      readonly operand: Expression<Raw>;
+      readonly values: readonly Expression<Raw>[] | SelectStatement<Raw>;
+      readonly negate?: boolean;
+    }
+  | {
+      readonly kind: "between";
+      readonly operand: Expression<Raw>;
+      readonly lower: Expression<Raw>;
+      readonly upper: Expression<Raw>;
+    }
+  | {
+      readonly kind: "aggregate";
+      readonly name: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+      readonly operand?: Expression<Raw>;
+      readonly distinct?: boolean;
+    }
+  | {
+      readonly kind: "raw";
+      readonly value: Raw;
+    }
+  | {
       readonly kind: "subquery";
-      readonly query: SelectStatement;
+      readonly query: SelectStatement<Raw>;
     };
 
-export type Relation =
+export type Relation<Raw = never> =
   | {
       readonly kind: "table";
       readonly name: QualifiedName;
       readonly alias?: string;
+      readonly presence?: string;
     }
   | {
       readonly kind: "subquery";
-      readonly query: SelectStatement;
+      readonly query: SelectStatement<Raw>;
       readonly alias: string;
+      readonly presence?: string;
     };
 
-export type Join =
+export type Join<Raw = never> =
   | {
       readonly kind: "cross";
-      readonly relation: Relation;
+      readonly relation: Relation<Raw>;
     }
   | {
       readonly kind: "inner" | "left" | "right" | "full";
-      readonly relation: Relation;
-      readonly on: Expression;
+      readonly relation: Relation<Raw>;
+      readonly on: Expression<Raw>;
     };
 
-export interface Projection {
-  readonly expression: Expression;
+export interface Projection<Raw = never> {
+  readonly expression: Expression<Raw>;
   readonly alias?: string;
 }
 
-interface CommonTableExpression {
+interface CommonTableExpression<Raw> {
   readonly name: string;
-  readonly query: SelectStatement;
+  readonly query: SelectStatement<Raw>;
 }
 
-interface OrderBy {
-  readonly expression: Expression;
+interface OrderBy<Raw> {
+  readonly expression: Expression<Raw>;
   readonly direction: "asc" | "desc";
 }
 
-export interface SelectStatement {
+export interface SelectStatement<Raw = never> {
   readonly kind: "select";
-  readonly with?: NonEmpty<CommonTableExpression>;
-  readonly projections: NonEmpty<Projection>;
+  readonly with?: NonEmpty<CommonTableExpression<Raw>>;
+  readonly distinct?: boolean;
+  readonly projections: NonEmpty<Projection<Raw>>;
   readonly from?: {
-    readonly relation: Relation;
-    readonly joins?: NonEmpty<Join>;
+    readonly relation: Relation<Raw>;
+    readonly joins?: NonEmpty<Join<Raw>>;
   };
-  readonly where?: Expression;
-  readonly groupBy?: NonEmpty<Expression>;
-  readonly having?: Expression;
-  readonly orderBy?: NonEmpty<OrderBy>;
+  readonly where?: Expression<Raw>;
+  readonly groupBy?: NonEmpty<Expression<Raw>>;
+  readonly having?: Expression<Raw>;
+  readonly orderBy?: NonEmpty<OrderBy<Raw>>;
   readonly limit?: {
     readonly count: number;
     readonly offset?: number;
   };
+  readonly offset?: number;
+  readonly sets?: readonly {
+    readonly operator: "UNION" | "UNION ALL" | "INTERSECT" | "EXCEPT";
+    readonly query: SelectStatement<Raw>;
+  }[];
 }
 
 interface InsertStatement {
@@ -161,8 +192,8 @@ interface DropTableStatement {
   readonly ifExists?: boolean;
 }
 
-export type Statement =
-  | SelectStatement
+export type Statement<Raw = never> =
+  | SelectStatement<Raw>
   | InsertStatement
   | UpdateStatement
   | DeleteStatement
