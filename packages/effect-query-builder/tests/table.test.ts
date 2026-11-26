@@ -688,6 +688,25 @@ test("keeps whole-row insert checks when an optional field has a database defaul
   ).toBe("Failure");
 });
 
+test("rejects insert fields that no longer match the checked struct", () => {
+  const fields = {
+    amount: Schema.Int,
+    note: Schema.optionalKey(Schema.String),
+  };
+
+  const schema = Schema.Struct(fields).check(
+    Schema.makeFilter(({ amount }) => amount.toFixed(0) === "1")
+  );
+
+  Object.assign(fields, { amount: Schema.optionalKey(Schema.Int) });
+
+  expect(() =>
+    Table.fromSchema("invoices", schema, {
+      columns: { note: { default: "NULL" } },
+    })
+  ).toThrow(/whole-row checks/iu);
+});
+
 test.each([
   ["generated", { generated: true }],
   ["defaulted", { default: "0" }],
