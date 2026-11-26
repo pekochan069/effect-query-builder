@@ -21,6 +21,7 @@
       "name": "effect-query-builder",
       "version": "0.0.0",
       "devDependencies": {
+        "@types/bun": "^1.4.4",
         "effect": "^4.0.0",
       },
       "peerDependencies": {
