@@ -1,0 +1,26 @@
+{
+  "name": "effect-query-builder",
+  "private": true,
+  "workspaces": [
+    "./packages.*"
+  ],
+  "type": "module",
+  "scripts": {
+    "check-types": "tsrs --noEmit --fast",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "@interfere/landmines": "^0.1.1",
+    "@shadcn/lint": "^0.2.5",
+    "@types/bun": "^1.4.0",
+    "eslint-plugin-tsdoc": "^0.5.4",
+    "lefthook": "^2.2.3",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2007",
+    "tsrs": "^7.1.0-beta.tsrs5",
+    "ultracite": "8.3.1"
+  }
+}
