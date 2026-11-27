@@ -2,9 +2,17 @@ import { Array as Arr, Effect, Predicate, Schema, SchemaAST } from "effect";
 import { forEach, map } from "effect/Effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
-import { isExpression, toExpressionNode } from "./expression.ts";
+import {
+  expressionSqlFamily,
+  isExpression,
+  toExpressionNode,
+} from "./expression.ts";
 import type { Expression } from "./expression.ts";
-import type { Expression as Node, Projection } from "./kernel/ast.ts";
+import type {
+  Expression as Node,
+  Projection,
+  SelectStatement,
+} from "./kernel/ast.ts";
 import { projectionAlias } from "./kernel/invariants.ts";
 import {
   derivedDefinition,
@@ -102,16 +110,14 @@ const markerExpression: (
     : { kind: "nullCheck", negate: true, operand };
 
 const inheritedMarker = (operand: SqlExpression, grouped: boolean) =>
-  grouped
-    ? markerExpression(
-        {
-          kind: "caseWhen",
-          condition: operand,
-          result: { kind: "numberLiteral", value: 1 },
-        },
-        true
-      )
-    : operand;
+  markerExpression(
+    {
+      kind: "caseWhen",
+      condition: operand,
+      result: { kind: "numberLiteral", value: 1 },
+    },
+    grouped
+  );
 
 const nonNullScalar = new Set<SchemaAST.AST["_tag"]>([
   "BigInt",
@@ -179,6 +185,7 @@ interface ProjectionSlot {
   readonly path: FieldPath;
   readonly markers?: readonly string[];
   readonly encoding?: string;
+  readonly booleanCodec?: "predicate" | "bit";
 }
 
 const literalFamily = (value: SchemaAST.LiteralValue) => {
@@ -225,34 +232,67 @@ const encodedFamily: (ast: SchemaAST.AST) => string | undefined = (ast) => {
     : undefined;
 };
 
+const projectionEncoding: (
+  schema: Schema.Constraint
+) => Pick<ProjectionSlot, "encoding" | "booleanCodec"> = (schema) => {
+  const family = expressionSqlFamily(schema.ast);
+
+  if (family === "number") {
+    return { encoding: family };
+  }
+
+  const encoding = encodedFamily(SchemaAST.toEncoded(schema.ast));
+
+  if (family === "boolean") {
+    return { encoding, booleanCodec: "predicate" };
+  }
+
+  if (family === "boolean bit") {
+    return { encoding, booleanCodec: "bit" };
+  }
+
+  return { encoding };
+};
+
+const matchesPredicate = (predicate: ProjectionSlot, other: ProjectionSlot) =>
+  predicate.booleanCodec === "predicate" &&
+  (other.encoding === "boolean" || other.booleanCodec === "bit");
+
 const requiresMarkers = (
   marker: string | undefined,
   inherited: readonly string[] = []
 ) => (marker === undefined ? inherited : [...inherited, marker]);
 
-export const assertCompatibleProjections = (
-  left: ProjectionPlan,
-  right: ProjectionPlan
-) => {
-  const layout = (plan: ProjectionPlan) =>
-    plan.columns.map(({ slot: { role, path, markers } }) => [
+type ProjectionColumn = ProjectionPlan["columns"][number];
+
+const projectionLayout = (columns: readonly ProjectionColumn[]) => {
+  const positions = new Map(columns.map(({ alias }, index) => [alias, index]));
+
+  return JSON.stringify(
+    columns.map(({ slot: { role, path, markers } }) => [
       role,
       path,
-      markers ?? [],
-    ]);
+      markers
+        ?.map((marker) => positions.get(marker))
+        .filter(Predicate.isNumber) ?? [],
+    ])
+  );
+};
 
-  if (JSON.stringify(layout(left)) !== JSON.stringify(layout(right))) {
-    throw new TypeError(
-      "Set operation operands must have the same SQL projection layout"
-    );
-  }
-
+const assertCompatibleEncoding = (
+  left: readonly ProjectionColumn[],
+  right: readonly ProjectionColumn[]
+) => {
   if (
-    left.columns.some(({ slot: { encoding } }, index) => {
-      const other = right.columns[index]?.slot.encoding;
+    left.some(({ slot }, index) => {
+      const other = right[index]?.slot;
 
       return (
-        encoding !== undefined && other !== undefined && encoding !== other
+        slot.encoding !== undefined &&
+        other?.encoding !== undefined &&
+        slot.encoding !== other.encoding &&
+        !matchesPredicate(slot, other) &&
+        !matchesPredicate(other, slot)
       );
     })
   ) {
@@ -260,6 +300,111 @@ export const assertCompatibleProjections = (
       "Set operation operands must have compatible encoded projections"
     );
   }
+};
+
+const omittableSetMarkers = (plan: ProjectionPlan, other: ProjectionPlan) => {
+  const markers = new Map<string, string>();
+
+  for (const [key, field] of Object.entries(plan.fields)) {
+    const opposite = Object.hasOwn(other.fields, key)
+      ? other.fields[key]
+      : undefined;
+
+    const { ast } = field.schema;
+
+    if (
+      field.inputs.length !== 2 ||
+      opposite?.inputs.length !== 1 ||
+      ast.encoding !== undefined ||
+      !nonNullScalar.has(ast._tag) ||
+      !preservesNull(opposite.schema.ast)
+    ) {
+      continue;
+    }
+
+    const marker = field.inputs.find((input) => input !== field.alias);
+    const column = plan.columns.find(({ alias }) => alias === marker);
+
+    if (
+      column === undefined ||
+      column.slot.path.length !== 1 ||
+      plan.columns.some(
+        ({ alias, slot }) =>
+          alias !== field.alias && slot.markers?.includes(column.alias) === true
+      )
+    ) {
+      continue;
+    }
+
+    markers.set(column.alias, opposite.alias);
+  }
+
+  return markers;
+};
+
+const incompatibleLayout = () =>
+  new TypeError(
+    "Set operation operands must have the same SQL projection layout"
+  );
+
+export const alignSetProjection: (
+  left: ProjectionPlan,
+  right: ProjectionPlan,
+  query: SelectStatement<Statement.Fragment>
+) => SelectStatement<Statement.Fragment> = (left, right, query) => {
+  if (projectionLayout(left.columns) === projectionLayout(right.columns)) {
+    assertCompatibleEncoding(left.columns, right.columns);
+
+    return query;
+  }
+
+  const leftMarkers = omittableSetMarkers(left, right);
+  const rightMarkers = omittableSetMarkers(right, left);
+
+  const leftColumns = left.columns.filter(
+    ({ alias }) => !leftMarkers.has(alias)
+  );
+
+  const rightColumns = right.columns.filter(
+    ({ alias }) => !rightMarkers.has(alias)
+  );
+
+  if (projectionLayout(leftColumns) !== projectionLayout(rightColumns)) {
+    throw incompatibleLayout();
+  }
+
+  assertCompatibleEncoding(leftColumns, rightColumns);
+
+  const source = "__eqb_set_operand";
+
+  const rightAliases = new Map(
+    leftColumns.map(({ alias }, index) => [alias, rightColumns[index]?.alias])
+  );
+
+  const reproject = ({ alias }: ProjectionColumn) => {
+    const forValue = leftMarkers.get(alias);
+    const name = forValue ?? rightAliases.get(alias);
+
+    if (name === undefined) {
+      throw incompatibleLayout();
+    }
+
+    const column = { kind: "column", name, table: source } as const;
+
+    return {
+      alias,
+      expression:
+        forValue === undefined ? column : markerExpression(column, false),
+    };
+  };
+
+  const [first, ...rest] = left.columns;
+
+  return {
+    from: { relation: { alias: source, kind: "subquery", query } },
+    kind: "select",
+    projections: [reproject(first), ...rest.map(reproject)],
+  };
 };
 
 const remapDecode: (
@@ -422,7 +567,7 @@ export const planProjection: (
         }
 
         const alias = add(toExpressionNode(column), {
-          encoding: encodedFamily(SchemaAST.toEncoded(column.schema.ast)),
+          ...projectionEncoding(column.schema),
           markers: requiresMarkers(marker),
           path: [...path, key],
           role: "value",
@@ -496,7 +641,7 @@ export const planProjection: (
       const alias = add(
         { kind: "column", name: field.alias, table: source.name },
         {
-          encoding: encodedFamily(SchemaAST.toEncoded(field.schema.ast)),
+          ...projectionEncoding(field.schema),
           markers: requiresMarkers(marker, markers),
           path,
           role: "value",
@@ -515,7 +660,7 @@ export const planProjection: (
       item.references.some((column) => nullable.has(column.table.name));
 
     const alias = add(toExpressionNode(item), {
-      encoding: encodedFamily(SchemaAST.toEncoded(item.schema.ast)),
+      ...projectionEncoding(item.schema),
       markers: requiresMarkers(marker),
       path,
       role: "value",

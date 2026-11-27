@@ -128,10 +128,11 @@ const numberSchema = Schema.Union([
   integerFromBigInt,
 ]);
 
-type SqlFamily = "boolean" | "number";
+type SqlFamily = "boolean" | "boolean bit" | "number";
 
 const expressionFamilies = new Map<SchemaAST.AST, SqlFamily>([
   [booleanSchema.ast, "boolean"],
+  [Schema.BooleanFromBit.ast, "boolean bit"],
   [countSchema.ast, "number"],
   [numberSchema.ast, "number"],
 ]);

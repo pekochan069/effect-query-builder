@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, expectTypeOf, test } from "bun:test";
 
-import { Effect, Option, Result, Schema, Stream } from "effect";
+import { Effect, Exit, Option, Result, Schema, Stream } from "effect";
 import { Reactivity } from "effect/reactivity";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
@@ -476,6 +476,184 @@ test("rejects set operands with incompatible encoded projections", () => {
   expect(() => left.unionAll(right).compile("sqlite")).toThrow(
     "Set operation operands must have compatible encoded projections"
   );
+});
+
+test("combines numeric expressions with columns in either set operand", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  const column = from(authors).select({ value: authors.c.id });
+  const total = from(books).select({ value: count() });
+
+  const incremented = from(books).select({
+    value: add(books.c.authorId, 2),
+  });
+
+  const run = (
+    query: Effect.Effect<
+      Effect.Success<typeof column>,
+      Effect.Error<typeof column>,
+      SqlClient.SqlClient
+    >
+  ) =>
+    Effect.runSync(
+      query.pipe(
+        Effect.map((rows) =>
+          rows.map(({ value }) => value).toSorted((left, right) => left - right)
+        ),
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.exit
+      )
+    );
+
+  expect(run(total.union(column).union(incremented))).toEqual(
+    Exit.succeed([1, 2, 3, 4])
+  );
+  expect(run(column.union(total).union(incremented))).toEqual(
+    Exit.succeed([1, 2, 3, 4])
+  );
+});
+
+test("combines predicates with columns that decode SQLite boolean bits", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  db.run("CREATE TABLE flags (value INTEGER)");
+  db.run("INSERT INTO flags VALUES (0)");
+
+  const flags = Table.fromSchema(
+    "flags",
+    Schema.Struct({ value: Schema.BooleanFromBit })
+  );
+
+  const column = from(flags).select({ value: flags.c.value });
+  const predicate = from(authors).select({ value: eq(authors.c.id, 1) });
+
+  const run = (
+    query: Effect.Effect<
+      Effect.Success<typeof column>,
+      Effect.Error<typeof column>,
+      SqlClient.SqlClient
+    >
+  ) =>
+    Effect.runSync(
+      query.pipe(
+        Effect.map((rows) => new Set(rows.map(({ value }) => value))),
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.exit
+      )
+    );
+
+  expect(run(predicate.union(column))).toEqual(
+    Exit.succeed(new Set([false, true]))
+  );
+  expect(run(column.union(predicate))).toEqual(
+    Exit.succeed(new Set([false, true]))
+  );
+});
+
+test("deduplicates NULL across joined and nullable scalar set operands", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  db.run("CREATE TABLE nullable_books (id INTEGER)");
+  db.run("INSERT INTO nullable_books VALUES (NULL), (2), (8)");
+
+  const nullableBooks = Table.fromSchema(
+    "nullable_books",
+    Schema.Struct({ id: Schema.NullOr(Schema.Int) })
+  );
+
+  const nullable = from(nullableBooks).select({ value: nullableBooks.c.id });
+
+  const joined = from(authors)
+    .leftJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ value: books.c.authorId });
+
+  const run = (
+    query: Effect.Effect<
+      Effect.Success<typeof joined>,
+      Effect.Error<typeof joined>,
+      SqlClient.SqlClient
+    >
+  ) =>
+    Effect.runSync(
+      query.pipe(
+        Effect.map((rows) =>
+          rows
+            .map(({ value }) => value)
+            .toSorted((left, right) => (left ?? -1) - (right ?? -1))
+        ),
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.exit
+      )
+    );
+
+  expect(run(joined.union(nullable))).toEqual(Exit.succeed([null, 1, 2, 8]));
+  expect(run(nullable.union(joined))).toEqual(Exit.succeed([null, 1, 2, 8]));
+  expect(run(joined.intersect(nullable))).toEqual(Exit.succeed([null, 2]));
+  expect(run(joined.except(nullable))).toEqual(Exit.succeed([1]));
+  expect(
+    run(
+      joined.union(nullable.except(nullable.where(eq(nullableBooks.c.id, 8))))
+    )
+  ).toEqual(Exit.succeed([null, 1, 2]));
+});
+
+test("deduplicates missing derived rows against nullable scalar set operands", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+
+  const inner = from(authors)
+    .leftJoin(books, eq(authors.c.id, books.c.authorId))
+    .where(neq(authors.c.id, 2))
+    .select({ id: authors.c.id, value: books.c.authorId })
+    .as("joined_books");
+
+  const joined = from(authors)
+    .leftJoin(inner, eq(authors.c.id, inner.c.id))
+    .select({ value: inner.c.value });
+
+  const nullable = select({ value: raw(Schema.NullOr(Schema.Int), sql`NULL`) });
+  const query = joined.union(nullable);
+
+  expect(
+    Effect.runSync(
+      query.pipe(
+        Effect.map((rows) =>
+          rows
+            .map(({ value }) => value)
+            .toSorted((left, right) => (left ?? -1) - (right ?? -1))
+        ),
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.exit
+      )
+    )
+  ).toEqual(Exit.succeed([null, 1]));
+});
+
+test("keeps a malformed matched row visible to the left set operand's codec", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  db.run("CREATE TABLE invalid_books (author_id INTEGER, value INTEGER)");
+  db.run("INSERT INTO invalid_books VALUES (1, NULL)");
+
+  const invalidBooks = Table.fromSchema(
+    "invalid_books",
+    Schema.Struct({ authorId: Schema.Int, value: Schema.Int }),
+    { naming: "snake_case" }
+  );
+
+  const joined = from(authors)
+    .leftJoin(invalidBooks, eq(authors.c.id, invalidBooks.c.authorId))
+    .select({ value: invalidBooks.c.value });
+
+  const nullable = select({ value: raw(Schema.NullOr(Schema.Int), sql`NULL`) });
+
+  expect(
+    Effect.runSync(
+      joined
+        .union(nullable)
+        .pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.result)
+    )
+  ).toMatchObject({ failure: { _tag: "SchemaError" } });
 });
 
 test("rejects set operands whose fields use different shared presence markers", () => {

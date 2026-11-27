@@ -35,10 +35,7 @@ import type {
 import { UnsupportedDialectClauseError } from "./kernel/errors.ts";
 import { compileSelect, toSelectFragment } from "./select-compiler.ts";
 import type { SelectDialect } from "./select-compiler.ts";
-import {
-  assertCompatibleProjections,
-  planProjection,
-} from "./select-projection.ts";
+import { alignSetProjection, planProjection } from "./select-projection.ts";
 import type {
   DecodeServices,
   ProjectionPlan,
@@ -950,11 +947,10 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       offset,
       orderBy: Arr.isReadonlyArrayNonEmpty(orderBy) ? orderBy : undefined,
       projections: plan.columns,
-      sets: sets.map(({ operand, operator }) => {
-        assertCompatibleProjections(plan, operand.plan);
-
-        return { operator, query: operand.ast };
-      }),
+      sets: sets.map(({ operand, operator }) => ({
+        operator,
+        query: alignSetProjection(plan, operand.plan, operand.ast),
+      })),
       where,
       with: Arr.isReadonlyArrayNonEmpty(ctes) ? ctes : undefined,
     } satisfies SelectAst;
