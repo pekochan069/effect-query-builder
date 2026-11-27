@@ -1,6 +1,6 @@
 import { Array as Arr, Effect, Effectable, Predicate } from "effect";
 import type { Schema } from "effect";
-import { flatMap, forEach } from "effect/Effect";
+import { flatMap, forEach, map } from "effect/Effect";
 import { identity } from "effect/Function";
 import { SqlClient } from "effect/sql";
 import type { SqlError, Statement } from "effect/sql";
@@ -8,10 +8,19 @@ import type { SqlError, Statement } from "effect/sql";
 import { inferColumnStorage } from "./column-storage.ts";
 import { getClientDialect, unsupportedDialect } from "./dialect.ts";
 import type { CheckDialect } from "./dialect.ts";
-import { isExpression, toExpressionNode } from "./expression.ts";
-import type { ExpressionDialect, PredicateInput } from "./expression.ts";
+import {
+  isExpression,
+  makeExpression,
+  toExpressionNode,
+} from "./expression.ts";
+import type {
+  Expression,
+  ExpressionDialect,
+  PredicateInput,
+} from "./expression.ts";
 import type {
   Expression as Node,
+  InsertConflict,
   Projection,
   Statement as QueryStatement,
 } from "./kernel/ast.ts";
@@ -168,8 +177,9 @@ type WriteReturn<
   M extends boolean,
   R,
   P extends ReturningSelection,
+  Upsert extends boolean,
 > = K extends "insert"
-  ? InsertQuery<T, D, M, R, P>
+  ? InsertQuery<T, D, M, R, P, Upsert>
   : K extends "update" | "delete"
     ? ChangeQuery<K, T, D, M, R, P>
     : never;
@@ -188,11 +198,12 @@ type Returning<
   D extends SqlDialect,
   M extends boolean,
   R,
+  Upsert extends boolean = false,
 > = [D & ReturningDialects<K, M>] extends [never]
   ? unknown
   : {
       readonly returning: {
-        (): WriteReturn<K, T, D & ReturningDialects<K, M>, M, R, T>;
+        (): WriteReturn<K, T, D & ReturningDialects<K, M>, M, R, T, Upsert>;
         <const P extends WriteProjection>(
           selection: P & CheckProjection<P, T, D & ReturningDialects<K, M>>
         ): WriteReturn<
@@ -201,7 +212,8 @@ type Returning<
           D & ReturningDialects<K, M> & ExpressionDialect<P[keyof P]>,
           M,
           R,
-          P
+          P,
+          Upsert
         >;
       };
     };
@@ -212,8 +224,90 @@ export type InsertQuery<
   M extends boolean = false,
   R = T["insert"]["EncodingServices"],
   P extends ReturningSelection = never,
+  Upsert extends boolean = false,
 > = WriteResultEffect<WriteResult<P>, D, R, WriteDecoders<P>> &
-  Returning<"insert", T, D, M, R>;
+  Returning<"insert", T, D, M, R, Upsert> &
+  (Upsert extends true ? unknown : ConflictMethods<T, D, M, R, P>);
+
+type ConflictKey<T extends TableSource> = Extract<keyof T["c"], string>;
+
+type ConflictTarget<T extends TableSource> =
+  | ConflictKey<T>
+  | NonEmpty<ConflictKey<T>>;
+
+type ConflictDialect = "pg" | "sqlite";
+
+type IncomingColumn<C extends Column> = Expression<
+  C["schema"],
+  never,
+  SqlDialect,
+  C["schema"]["Encoded"]
+>;
+
+interface UpsertScope<T extends TableSource> {
+  readonly target: T;
+  readonly incoming: <Key extends ConflictKey<T>>(
+    key: Key
+  ) => IncomingColumn<T["c"][Key]>;
+}
+
+type UpsertPatch<T extends TableSource, Input> =
+  | Input
+  | ((scope: UpsertScope<T>) => Input);
+
+type UpsertInput<
+  T extends TableSource,
+  Input,
+  D extends SqlDialect,
+> = UpsertPatch<
+  T,
+  Input & CompatibleValue<T["update"], Input, WriteTargetColumns<T>, D>
+>;
+
+type UpdatedInsert<
+  T extends TableSource,
+  D extends SqlDialect,
+  M extends boolean,
+  R,
+  P extends ReturningSelection,
+  Input,
+> = InsertQuery<
+  T,
+  D & ExpressionDialect<WriteInputValues<Input>>,
+  M,
+  R | T["update"]["EncodingServices"],
+  P,
+  true
+>;
+
+type ConflictMethods<
+  T extends TableSource,
+  D extends SqlDialect,
+  M extends boolean,
+  R,
+  P extends ReturningSelection,
+> = ([D & ConflictDialect] extends [never]
+  ? unknown
+  : {
+      readonly onConflictDoNothing: (
+        target?: ConflictTarget<T>
+      ) => InsertQuery<T, D & ConflictDialect, M, R, P, true>;
+      readonly onConflictDoUpdate: <
+        const Input extends WriteInput<T["update"]>,
+      >(
+        target: ConflictTarget<T>,
+        patch: UpsertInput<T, Input, D & ConflictDialect>
+      ) => UpdatedInsert<T, D & ConflictDialect, M, R, P, Input>;
+    }) &
+  ("mysql" extends D
+    ? {
+        readonly onDuplicateKeyUpdate: <
+          const Input extends WriteInput<T["update"]>,
+        >(
+          patch: UpsertInput<T, Input, "mysql">
+        ) => UpdatedInsert<T, "mysql", M, R, P, Input>;
+      }
+    : unknown);
 
 type ScopedPredicate<P extends PredicateInput, T extends TableSource> =
   | P
@@ -452,29 +546,115 @@ const insertSelect = (table: TableSource, query: QueryOperand) =>
     } satisfies WriteAst;
   });
 
-const updateAssignments = (table: TableSource, input: WriteRow) =>
-  Effect.gen(function* buildUpdate() {
+const requiredAssignments = (
+  table: TableSource,
+  input: WriteRow,
+  clause: string
+) =>
+  Effect.gen(function* buildAssignments() {
     const assignments = yield* encodeWriteRow(table, "update", input);
 
     if (!Arr.isReadonlyArrayNonEmpty(assignments)) {
       return yield* new WriteInputError({
-        message: "UPDATE requires at least one assignment",
+        message: `${clause} requires at least one assignment`,
       });
     }
 
-    return {
-      alias: table.alias,
-      assignments,
-      kind: "update",
-      table: table.identifier,
-    } satisfies WriteAst;
+    return assignments;
   });
+
+const updateAssignments = (table: TableSource, input: WriteRow) =>
+  map(
+    requiredAssignments(table, input, "UPDATE"),
+    (assignments) =>
+      ({
+        alias: table.alias,
+        assignments,
+        kind: "update",
+        table: table.identifier,
+      }) satisfies WriteAst
+  );
 
 const operation = {
   delete: "DELETE",
   insert: "INSERT",
   update: "UPDATE",
 } as const;
+
+const conflictColumns = (
+  table: TableSource,
+  target: string | readonly string[]
+) =>
+  Effect.gen(function* resolveConflictColumns() {
+    const keys = Predicate.isString(target) ? [target] : target;
+    const columns: string[] = [];
+
+    if (!Arr.isArray(keys)) {
+      return yield* new WriteInputError({
+        message: "A conflict target needs distinct columns",
+      });
+    }
+
+    for (const key of keys) {
+      const column = Object.hasOwn(table.c, key) ? table.c[key] : undefined;
+
+      if (column === undefined) {
+        return yield* new WriteInputError({
+          message: `Unknown conflict column: ${key}`,
+        });
+      }
+
+      columns.push(column.name);
+    }
+
+    if (
+      !Arr.isReadonlyArrayNonEmpty(columns) ||
+      new Set(columns).size !== columns.length
+    ) {
+      return yield* new WriteInputError({
+        message: "A conflict target needs distinct columns",
+      });
+    }
+
+    return columns;
+  });
+
+const incomingColumn = (target: TableSource, key: string) => {
+  const column = Object.hasOwn(target.c, key) ? target.c[key] : undefined;
+
+  if (column === undefined) {
+    throw new WriteInputError({ message: `Unknown incoming column: ${key}` });
+  }
+
+  return makeExpression(
+    column.schema,
+    { kind: "incomingColumn", name: column.name },
+    []
+  ) satisfies IncomingColumn<Column>;
+};
+
+const upsertAssignments = (
+  target: TableSource,
+  patch: UpsertPatch<TableSource, WriteRow>,
+  clause: string
+) =>
+  Effect.gen(function* buildUpsertAssignments() {
+    let values: WriteRow;
+
+    try {
+      values = Predicate.isFunction(patch)
+        ? patch({ target, incoming: (key) => incomingColumn(target, key) })
+        : patch;
+    } catch (error) {
+      if (error instanceof WriteInputError) {
+        return yield* error;
+      }
+
+      throw error;
+    }
+
+    return yield* requiredAssignments(target, values, clause);
+  });
 
 interface WriteState {
   readonly target: TableSource;
@@ -490,6 +670,12 @@ interface WriteState {
   readonly projection?: ProjectionPlan;
 }
 
+type ConflictEffect = Effect.Effect<
+  InsertConflict<Statement.Fragment>,
+  Schema.SchemaError | WriteInputError,
+  unknown
+>;
+
 class Write extends Effectable.Class<
   readonly unknown[] | undefined,
   WriteError,
@@ -500,6 +686,67 @@ class Write extends Effectable.Class<
   constructor(state: WriteState) {
     super();
     this.#state = state;
+  }
+
+  #withConflict(conflict: ConflictEffect) {
+    return new Write({
+      ...this.#state,
+      build: flatMap(this.#state.build, (statement) => {
+        if (statement.kind !== "insert") {
+          return Effect.fail(
+            new WriteInputError({ message: "An upsert needs an INSERT" })
+          );
+        }
+
+        return map(conflict, (clause) => ({
+          ...statement,
+          conflict: clause,
+        }));
+      }),
+    });
+  }
+
+  onConflictDoNothing(target?: string | readonly string[]) {
+    const columns =
+      target === undefined
+        ? Effect.succeed(undefined)
+        : conflictColumns(this.#state.target, target);
+
+    return this.#withConflict(
+      map(columns, (value) => ({
+        columns: value,
+        kind: "doNothing",
+      }))
+    );
+  }
+
+  onConflictDoUpdate(
+    target: string | readonly string[],
+    patch: UpsertPatch<TableSource, WriteRow>
+  ) {
+    const table = this.#state.target;
+
+    const conflict = Effect.gen(function* buildConflict() {
+      const columns = yield* conflictColumns(table, target);
+      const assignments = yield* upsertAssignments(table, patch, "DO UPDATE");
+
+      return {
+        assignments,
+        columns,
+        kind: "doUpdate",
+      } satisfies InsertConflict<Statement.Fragment>;
+    });
+
+    return this.#withConflict(conflict);
+  }
+
+  onDuplicateKeyUpdate(patch: UpsertPatch<TableSource, WriteRow>) {
+    return this.#withConflict(
+      map(
+        upsertAssignments(this.#state.target, patch, "ON DUPLICATE KEY UPDATE"),
+        (assignments) => ({ assignments, kind: "duplicateKeyUpdate" })
+      )
+    );
   }
 
   where(input: PredicateInput | ((target: TableSource) => PredicateInput)) {

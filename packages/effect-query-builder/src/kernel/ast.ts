@@ -49,6 +49,7 @@ export type Expression<Raw = never> =
     }
   | { readonly kind: "nullLiteral" }
   | { readonly kind: "defaultValue" }
+  | { readonly kind: "incomingColumn"; readonly name: string }
   | {
       readonly kind: "binary";
       readonly operator: BinaryOperator;
@@ -172,6 +173,7 @@ interface WriteTarget<Raw> {
 
 export type InsertStatement<Raw = never> = WriteTarget<Raw> & {
   readonly kind: "insert";
+  readonly conflict?: InsertConflict<Raw>;
 } & (
     | {
         readonly columns: NonEmpty<string>;
@@ -183,6 +185,18 @@ export type InsertStatement<Raw = never> = WriteTarget<Raw> & {
       }
     | { readonly defaultRows: number; readonly defaultColumn?: string }
   );
+
+export type InsertConflict<Raw = never> =
+  | { readonly kind: "doNothing"; readonly columns?: NonEmpty<string> }
+  | {
+      readonly kind: "doUpdate";
+      readonly columns: NonEmpty<string>;
+      readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+    }
+  | {
+      readonly kind: "duplicateKeyUpdate";
+      readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+    };
 
 export interface WriteAssignment<Raw = never> {
   readonly column: string;

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 
-import { DateTime, Effect, Schema, Stream } from "effect";
+import { DateTime, Effect, Result, Schema, Stream } from "effect";
 import { Reactivity } from "effect/reactivity";
 import { Model } from "effect/schema";
 import { SqlClient, SqlError, Statement } from "effect/sql";
@@ -15,11 +15,13 @@ import {
   from,
   insertInto,
   raw,
+  select,
   Table,
   update,
 } from "../src/index.ts";
 import * as mysql from "../src/mysql.ts";
 import * as pg from "../src/pg.ts";
+import * as sqlite from "../src/sqlite.ts";
 
 const UserId = Schema.Int.pipe(Schema.brand("UserId"));
 
@@ -448,4 +450,226 @@ test("preserves separate database defaults in bulk on PostgreSQL and reports the
   expect(
     Effect.runSync(Effect.flip(query.compile("sqlite"))).message
   ).toContain("DEFAULT in VALUES is unsupported");
+});
+
+const totals = Table.withNaming("snake_case").fromSchema(
+  "totals",
+  Schema.Struct({ itemId: Schema.Int, hitCount: Schema.Int })
+);
+
+test("ignores existing rows by logical conflict target and returns only inserted rows", () => {
+  using database = new Database(":memory:");
+  database.run(
+    "CREATE TABLE totals (item_id INTEGER PRIMARY KEY, hit_count INTEGER NOT NULL)"
+  );
+  database.run("INSERT INTO totals VALUES (1, 2)");
+  const client = makeClient(database);
+
+  const query = sqlite
+    .insertInto(totals)
+    .values([
+      { itemId: 1, hitCount: 7 },
+      { itemId: 2, hitCount: 9 },
+    ])
+    .onConflictDoNothing("itemId")
+    .returning();
+
+  expect(Effect.runSync(query.compile("sqlite")).sql).toContain(
+    'ON CONFLICT ("item_id") DO NOTHING RETURNING'
+  );
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, client))
+  ).toEqual([{ itemId: 2, hitCount: 9 }]);
+  expect(database.query("SELECT * FROM totals ORDER BY item_id").all()).toEqual(
+    [
+      { item_id: 1, hit_count: 2 },
+      { item_id: 2, hit_count: 9 },
+    ]
+  );
+});
+
+test("updates conflicts from INSERT SELECT with existing and incoming values", () => {
+  using database = new Database(":memory:");
+  database.run(
+    "CREATE TABLE totals (item_id INTEGER PRIMARY KEY, hit_count INTEGER NOT NULL)"
+  );
+  database.run("INSERT INTO totals VALUES (1, 2)");
+  database.run("CREATE TABLE stage (item_id INTEGER, hit_count INTEGER)");
+  database.run("INSERT INTO stage VALUES (1, 7), (2, 9)");
+  const client = makeClient(database);
+
+  const stage = Table.withNaming("snake_case").fromSchema(
+    "stage",
+    totals.select
+  );
+
+  const source = from(stage).select({
+    itemId: stage.c.itemId,
+    hitCount: add(stage.c.hitCount, 3),
+  });
+
+  const query = insertInto(totals)
+    .fromSelect(source)
+    .returning({ hits: totals.c.hitCount })
+    .onConflictDoUpdate(["itemId"], ({ incoming, target }) => ({
+      hitCount: add(add(target.c.hitCount, incoming("hitCount")), 5),
+    }));
+
+  expect(Effect.runSync(query.compile("pg"))).toEqual({
+    params: [3, 5],
+    sql: 'INSERT INTO "totals" ("hit_count", "item_id") SELECT "__eqb_insert_source"."__eqb_0" AS "__eqb_0", "__eqb_insert_source"."__eqb_1" AS "__eqb_1" FROM (SELECT ("stage"."hit_count" + $1) AS "__eqb_0", "stage"."item_id" AS "__eqb_1" FROM "stage") AS "__eqb_insert_source" ON CONFLICT ("item_id") DO UPDATE SET "hit_count" = (("totals"."hit_count" + "excluded"."hit_count") + $2) RETURNING "totals"."hit_count" AS "__eqb_0"',
+  });
+  expect(
+    Effect.runSync(
+      query.pipe(
+        Effect.provideService(SqlClient.SqlClient, client),
+        Effect.map((rows) =>
+          rows.map(({ hits }) => hits).toSorted((left, right) => left - right)
+        ),
+        Effect.result
+      )
+    )
+  ).toEqual(Result.succeed([12, 17]));
+  expect(database.query("SELECT * FROM totals ORDER BY item_id").all()).toEqual(
+    [
+      { item_id: 1, hit_count: 17 },
+      { item_id: 2, hit_count: 12 },
+    ]
+  );
+});
+
+test("encodes duplicate-key patches for MySQL and keeps MariaDB INSERT RETURNING", () => {
+  const counters = Table.withNaming("snake_case").fromSchema(
+    "counters",
+    Schema.Struct({
+      itemId: Schema.Int,
+      enabled: Schema.BooleanFromBit,
+      hitCount: Schema.Int,
+    })
+  );
+
+  const row = { itemId: 1, enabled: true, hitCount: 4 };
+
+  const strict = mysql
+    .insertInto(counters)
+    .values(row)
+    .onDuplicateKeyUpdate(({ incoming, target }) => ({
+      enabled: false,
+      hitCount: add(target.c.hitCount, incoming("hitCount")),
+    }));
+
+  const maria = mysql.mariadb
+    .insertInto(counters)
+    .values(row)
+    .onDuplicateKeyUpdate(({ incoming }) => ({
+      hitCount: incoming("hitCount"),
+      enabled: false,
+    }))
+    .returning({ enabled: counters.c.enabled });
+
+  expect(Effect.runSync(strict.compile("mysql"))).toEqual({
+    params: [1, 1, 4, 0],
+    sql: "INSERT INTO `counters` (`item_id`, `enabled`, `hit_count`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `enabled` = ?, `hit_count` = (`counters`.`hit_count` + VALUES(`hit_count`))",
+  });
+  expect(Effect.runSync(maria.compile("mysql"))).toEqual({
+    params: [1, 1, 4, 0],
+    sql: "INSERT INTO `counters` (`item_id`, `enabled`, `hit_count`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `enabled` = ?, `hit_count` = VALUES(`hit_count`) RETURNING `counters`.`enabled` AS `__eqb_0`",
+  });
+});
+
+test("distinguishes the incoming row from a table named excluded", () => {
+  using database = new Database(":memory:");
+  database.run(
+    "CREATE TABLE excluded (item_id INTEGER PRIMARY KEY, hit_count INTEGER)"
+  );
+  database.run("INSERT INTO excluded VALUES (1, 2)");
+  const client = makeClient(database);
+
+  const excluded = Table.withNaming("snake_case").fromSchema(
+    "excluded",
+    totals.select
+  );
+
+  const query = insertInto(excluded)
+    .values({ itemId: 1, hitCount: 8 })
+    .onConflictDoUpdate("itemId", ({ incoming, target }) => ({
+      hitCount: add(target.c.hitCount, incoming("hitCount")),
+    }))
+    .returning({ hits: excluded.c.hitCount });
+
+  expect(Effect.runSync(query.compile("pg")).sql).toBe(
+    'INSERT INTO "excluded" AS "__eqb_insert_target" ("item_id", "hit_count") VALUES ($1, $2) ON CONFLICT ("item_id") DO UPDATE SET "hit_count" = ("__eqb_insert_target"."hit_count" + "excluded"."hit_count") RETURNING "__eqb_insert_target"."hit_count" AS "__eqb_0"'
+  );
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, client))
+  ).toEqual([{ hits: 10 }]);
+});
+
+test("fails invalid conflict input before sending a statement", () => {
+  const generated = Table.fromSchema(
+    "generated",
+    Schema.Struct({ id: Schema.Int }),
+    {
+      columns: { id: { generated: true } },
+    }
+  );
+
+  const defaultOnly = sqlite
+    .insertInto(generated)
+    .values({})
+    .onConflictDoNothing();
+
+  const duplicateTarget = pg
+    .insertInto(totals)
+    .values({ itemId: 1, hitCount: 2 })
+    .onConflictDoNothing(["itemId", "itemId"]);
+
+  const noAssignments = pg
+    .insertInto(totals)
+    .values({ itemId: 1, hitCount: 2 })
+    .onConflictDoUpdate("itemId", {});
+
+  expect(
+    Effect.runSync(Effect.result(defaultOnly.compile("sqlite")))
+  ).toMatchObject({
+    _tag: "Failure",
+    failure: {
+      message:
+        "Upsert with default-only INSERT is unsupported by the sqlite dialect profile",
+    },
+  });
+  expect(
+    Effect.runSync(Effect.result(duplicateTarget.compile("pg")))
+  ).toMatchObject({
+    _tag: "Failure",
+    failure: { message: "A conflict target needs distinct columns" },
+  });
+  expect(
+    Effect.runSync(Effect.result(noAssignments.compile("pg")))
+  ).toMatchObject({
+    _tag: "Failure",
+    failure: { message: "DO UPDATE requires at least one assignment" },
+  });
+});
+
+test("rejects an incoming column inside a MySQL scalar subquery", () => {
+  const maybeTotals = Table.fromSchema(
+    "maybe_totals",
+    Schema.Struct({
+      itemId: Schema.Int,
+      hitCount: Schema.NullOr(Schema.Int),
+    })
+  );
+
+  const query = mysql
+    .insertInto(maybeTotals)
+    .values({ itemId: 1, hitCount: 7 })
+    .onDuplicateKeyUpdate(({ incoming }) => ({
+      hitCount: select({ hits: incoming("hitCount") }).scalar("hits"),
+    }));
+
+  expect(Effect.runSync(Effect.result(query.compile("mysql")))).toMatchObject({
+    _tag: "Failure",
+    failure: { message: "Incoming columns require an upsert assignment" },
+  });
 });

@@ -1,6 +1,7 @@
 import type {
   DeleteStatement,
   Expression,
+  InsertConflict,
   InsertStatement,
   Join,
   Projection,
@@ -9,6 +10,7 @@ import type {
   SelectStatement,
   Statement,
   UpdateStatement,
+  WriteAssignment,
 } from "./ast.ts";
 import { UnsupportedDialectClauseError } from "./errors.ts";
 import {
@@ -68,6 +70,7 @@ class Compiler<Raw> {
   readonly #profile: DialectProfile | undefined;
   readonly #write: (token: CompilerToken<Raw>) => void;
   #qualifier?: ColumnQualifier;
+  #updatingConflict?: "doUpdate" | "duplicateKeyUpdate";
 
   constructor(
     target: CompileTarget | undefined,
@@ -274,6 +277,12 @@ class Compiler<Raw> {
     switch (expression.kind) {
       case "column": {
         this.#column(expression);
+
+        return;
+      }
+
+      case "incomingColumn": {
+        this.#incomingColumn(expression.name);
 
         return;
       }
@@ -559,10 +568,18 @@ class Compiler<Raw> {
   }
 
   #subquery(query: SelectStatement<Raw>) {
+    const updatingConflict = this.#updatingConflict;
+    this.#updatingConflict = undefined;
     this.#text("(");
-    this.#withQualifier(undefined, () => {
-      this.#select(query);
-    });
+
+    try {
+      this.#withQualifier(undefined, () => {
+        this.#select(query);
+      });
+    } finally {
+      this.#updatingConflict = updatingConflict;
+    }
+
     this.#text(")");
   }
 
@@ -730,9 +747,89 @@ class Compiler<Raw> {
     this.#text("INSERT INTO ");
     this.#qualifiedName(statement.table);
 
+    const { conflict, table } = statement;
+
+    const targetName =
+      this.#dialect === "sqlite" ? table.name.toLowerCase() : table.name;
+
+    const qualify = conflict?.kind === "doUpdate" && targetName === "excluded";
+    const targetAlias = "__eqb_insert_target";
+
+    if (qualify) {
+      this.#alias(targetAlias);
+    }
+
+    this.#insertSource(statement);
+
+    this.#withQualifier(
+      qualify
+        ? { kind: "replace", from: table.name, to: targetAlias }
+        : undefined,
+      () => {
+        if (conflict !== undefined) {
+          this.#conflict(conflict);
+        }
+
+        this.#returning(statement);
+      }
+    );
+  }
+
+  #incomingColumn(name: string) {
+    if (this.#updatingConflict === "doUpdate") {
+      this.#qualifiedName({ name, schema: "excluded" });
+    } else if (this.#updatingConflict === "duplicateKeyUpdate") {
+      this.#text("VALUES(");
+      this.#identifier(name);
+      this.#text(")");
+    } else {
+      throw new UnsupportedDialectClauseError(
+        "Incoming columns require an upsert assignment"
+      );
+    }
+  }
+
+  #conflict(conflict: InsertConflict<Raw>) {
+    if (conflict.kind === "duplicateKeyUpdate") {
+      this.#requireDialect("ON DUPLICATE KEY UPDATE", "mysql");
+      this.#text(" ON DUPLICATE KEY UPDATE ");
+    } else {
+      this.#requireDialect("ON CONFLICT", "pg", "sqlite");
+      this.#text(" ON CONFLICT");
+
+      if (conflict.columns !== undefined) {
+        this.#text(" (");
+        this.#list(conflict.columns, (column) => {
+          this.#identifier(column);
+        });
+        this.#text(")");
+      }
+
+      if (conflict.kind === "doNothing") {
+        this.#text(" DO NOTHING");
+
+        return;
+      }
+
+      this.#text(" DO UPDATE SET ");
+    }
+
+    this.#updatingConflict = conflict.kind;
+
+    try {
+      this.#assignments(conflict.assignments);
+    } finally {
+      this.#updatingConflict = undefined;
+    }
+  }
+
+  #insertSource(statement: InsertStatement<Raw>) {
     if ("defaultRows" in statement) {
+      if (statement.conflict !== undefined) {
+        this.#requireDialect("Upsert with default-only INSERT", "pg", "mysql");
+      }
+
       this.#defaultInsert(statement.defaultRows, statement.defaultColumn);
-      this.#returning(statement);
 
       return;
     }
@@ -744,7 +841,7 @@ class Compiler<Raw> {
     this.#text(") ");
 
     if ("select" in statement) {
-      this.#select(statement.select);
+      this.#insertSelect(statement.select, statement.conflict !== undefined);
     } else {
       this.#text("VALUES ");
       this.#list(statement.rows, (row) => {
@@ -759,8 +856,22 @@ class Compiler<Raw> {
         this.#text(")");
       });
     }
+  }
 
-    this.#returning(statement);
+  #insertSelect(select: SelectStatement<Raw>, hasConflict: boolean) {
+    if (this.#dialect !== "sqlite" || !hasConflict) {
+      this.#select(select);
+    } else if ((select.sets?.length ?? 0) === 0) {
+      this.#select({
+        ...select,
+        where: select.where ?? { kind: "booleanLiteral", value: true },
+      });
+    } else {
+      this.#text("SELECT * FROM ");
+      this.#subquery(select);
+      this.#alias("__eqb_upsert_source");
+      this.#text(" WHERE 1");
+    }
   }
 
   #defaultInsert(count: number, column: string | undefined) {
@@ -787,6 +898,14 @@ class Compiler<Raw> {
     }
   }
 
+  #assignments(assignments: readonly WriteAssignment<Raw>[]) {
+    this.#list(assignments, ({ column, value }) => {
+      this.#identifier(column);
+      this.#text(" = ");
+      this.#expression(value);
+    });
+  }
+
   #update(statement: UpdateStatement<Raw>) {
     this.#text("UPDATE ");
     this.#qualifiedName(statement.table);
@@ -796,11 +915,7 @@ class Compiler<Raw> {
     }
 
     this.#text(" SET ");
-    this.#list(statement.assignments, ({ column, value }) => {
-      this.#identifier(column);
-      this.#text(" = ");
-      this.#expression(value);
-    });
+    this.#assignments(statement.assignments);
     this.#predicate("WHERE", statement.where);
     this.#returning(statement);
   }
