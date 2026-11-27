@@ -1,3 +1,5 @@
+export type { Dialect } from "./dialect.ts";
+
 export type { ColumnNaming } from "./column-names.ts";
 
 export type { SqlTypes } from "./column-storage.ts";

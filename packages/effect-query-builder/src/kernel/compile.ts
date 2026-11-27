@@ -40,6 +40,10 @@ const joinSql = {
   right: "RIGHT JOIN",
 } satisfies Record<Join["kind"], string>;
 
+const pgOperators = new Set<
+  Extract<Expression, { kind: "binary" }>["operator"]
+>(["ILIKE", "->", "->>", "@>", "?"]);
+
 const offsetOnlyLimit = {
   pg: "",
   portable: " LIMIT 9223372036854775807",
@@ -225,6 +229,26 @@ class Compiler<Raw> {
     this.#text(String(value));
   }
 
+  #booleanLiteral(value: boolean) {
+    if (this.#dialect === "sqlite") {
+      this.#text(value ? "1" : "0");
+    } else {
+      this.#text(value ? "TRUE" : "FALSE");
+    }
+  }
+
+  #binary(expression: Extract<Expression<Raw>, { kind: "binary" }>) {
+    if (pgOperators.has(expression.operator)) {
+      this.#requireDialect(expression.operator, "pg");
+    }
+
+    this.#text("(");
+    this.#expression(expression.left);
+    this.#text(` ${expression.operator} `);
+    this.#expression(expression.right);
+    this.#text(")");
+  }
+
   #expression(expression: Expression<Raw>) {
     switch (expression.kind) {
       case "column": {
@@ -255,11 +279,7 @@ class Compiler<Raw> {
       }
 
       case "booleanLiteral": {
-        if (this.#dialect === "sqlite") {
-          this.#text(expression.value ? "1" : "0");
-        } else {
-          this.#text(expression.value ? "TRUE" : "FALSE");
-        }
+        this.#booleanLiteral(expression.value);
 
         return;
       }
@@ -271,10 +291,17 @@ class Compiler<Raw> {
       }
 
       case "binary": {
-        this.#text("(");
-        this.#expression(expression.left);
-        this.#text(` ${expression.operator} `);
-        this.#expression(expression.right);
+        this.#binary(expression);
+
+        return;
+      }
+
+      case "sqliteJson": {
+        this.#requireDialect(expression.name, "sqlite");
+        this.#text(`${expression.name}(`);
+        this.#expression(expression.operand);
+        this.#text(", ");
+        this.#expression(expression.path);
         this.#text(")");
 
         return;
@@ -469,6 +496,19 @@ class Compiler<Raw> {
     this.#identifier(alias);
   }
 
+  #requireDialect(sql: string, ...dialects: readonly SqlDialect[]) {
+    const dialect = this.#dialect;
+
+    if (
+      dialect !== undefined &&
+      (this.#profile === "portable" || !dialects.includes(dialect))
+    ) {
+      throw new UnsupportedDialectClauseError(
+        `${sql} is unsupported by the ${this.#profile} dialect profile`
+      );
+    }
+  }
+
   #requireClause(clause: ConditionalClause, sql: string) {
     if (this.#profile !== undefined && !supportsClause(this.#profile, clause)) {
       throw new UnsupportedDialectClauseError(
@@ -536,6 +576,10 @@ class Compiler<Raw> {
   }
 
   #select(query: SelectStatement<Raw>) {
+    if (query.dialect !== undefined) {
+      this.#requireDialect(`SELECT scoped to ${query.dialect}`, query.dialect);
+    }
+
     if (query.with !== undefined) {
       this.#text("WITH ");
       this.#list(query.with, (cte) => {
@@ -564,7 +608,21 @@ class Compiler<Raw> {
   }
 
   #selectBody(query: SelectStatement<Raw>) {
-    this.#text(query.distinct === true ? "SELECT DISTINCT " : "SELECT ");
+    const { distinct } = query;
+
+    this.#text("SELECT ");
+
+    if (distinct === true) {
+      this.#text("DISTINCT ");
+    } else if (distinct !== undefined && distinct !== false) {
+      this.#requireDialect("DISTINCT ON", "pg");
+      this.#text("DISTINCT ON (");
+      this.#list(distinct, (expression) => {
+        this.#groupOrOrderExpression(expression);
+      });
+      this.#text(") ");
+    }
+
     this.#projections(query.projections, query.orderBy);
 
     if (query.from !== undefined) {
@@ -605,6 +663,11 @@ class Compiler<Raw> {
 
     if (offset !== undefined) {
       this.#limitValue("OFFSET", offset);
+    }
+
+    if (query.forUpdate === true) {
+      this.#requireDialect("FOR UPDATE", "pg", "mysql");
+      this.#text(" FOR UPDATE");
     }
   }
 
@@ -694,9 +757,9 @@ export const compile = (target: CompileTarget, statement: Statement) => {
   return renderTokens(tokens, compiler.dialect === "pg");
 };
 
-export const renderSelect = <Raw>(
-  dialect: SqlDialect | undefined,
-  query: SelectStatement<Raw>,
+export const renderStatement = <Raw>(
+  dialect: CompileTarget | undefined,
+  query: Statement<Raw>,
   write: (token: CompilerToken<Raw>) => void
 ) => {
   new Compiler(dialect, write).compile(query);

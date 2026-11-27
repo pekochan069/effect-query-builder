@@ -18,6 +18,11 @@ type BinaryOperator =
   | "/"
   | "AND"
   | "LIKE"
+  | "ILIKE"
+  | "->"
+  | "->>"
+  | "@>"
+  | "?"
   | "OR";
 
 export type Expression<Raw = never> =
@@ -82,6 +87,12 @@ export type Expression<Raw = never> =
       readonly result: Expression<Raw>;
     }
   | {
+      readonly kind: "sqliteJson";
+      readonly name: "json_extract" | "json_type" | "json_array_length";
+      readonly operand: Expression<Raw>;
+      readonly path: Expression<Raw>;
+    }
+  | {
       readonly kind: "raw";
       readonly value: Raw;
     }
@@ -133,7 +144,9 @@ interface OrderBy<Raw> {
 export interface SelectStatement<Raw = never> {
   readonly kind: "select";
   readonly with?: NonEmpty<CommonTableExpression<Raw>>;
-  readonly distinct?: boolean;
+  readonly dialect?: "pg" | "sqlite" | "mysql";
+  readonly distinct?: boolean | NonEmpty<Expression<Raw>>;
+  readonly forUpdate?: boolean;
   readonly projections: NonEmpty<Projection<Raw>>;
   readonly from?: {
     readonly relation: Relation<Raw>;

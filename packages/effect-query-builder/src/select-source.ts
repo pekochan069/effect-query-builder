@@ -48,11 +48,17 @@ export type ScalarValue<P, Key extends ScalarKey<P>> = FieldSqlValue<
   Key
 > | null;
 
-type FieldSchema<P, Key extends ScalarKey<P>> = ScalarFields<P>[Key] extends
-  | Column
-  | Expression
+export type FieldSchema<
+  P,
+  Key extends ScalarKey<P>,
+> = ScalarFields<P>[Key] extends Column | Expression
   ? ScalarFields<P>[Key]["schema"]
   : never;
+
+export type ScalarEncoded<P, Key extends ScalarKey<P>> = FieldSchema<
+  P,
+  Key
+>["Encoded"];
 
 type FieldValue<Row, Key extends string> = Key extends keyof NonNullable<Row>
   ? NonNullable<Row>[Key]
