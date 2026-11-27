@@ -31,6 +31,8 @@ In SQLite, every row in a bulk batch must supply the same nonempty set of column
 
 The `/pg`, `/sqlite`, and `/mysql` entry points scope builders to those dialects. PostgreSQL and SQLite support `.onConflictDoNothing()` and `.onConflictDoUpdate(target, patch)`. MySQL supports `.onDuplicateKeyUpdate(patch)`. Use `.returning()` to decode the full table row or pass a projection to decode selected fields. The `mariadb` export from `/mysql` enables `INSERT … RETURNING` and `DELETE … RETURNING` on MariaDB 10.5 or later. [MariaDB 10.5 release notes](https://mariadb.com/docs/release-notes/community-server/old-releases/10.5/what-is-mariadb-105)
 
+When interpolating a scoped or dialect-specific SELECT into an Effect SQL template, use `.toFragment(dialect)` with the dialect of the client that will run the statement. Running the builder directly as an Effect checks the dialect against `SqlClient`.
+
 ## Development
 
 ```bash

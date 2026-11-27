@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Schema, SchemaTransformation } from "effect";
 import type { Effect } from "effect";
 import { and, desc, eq, from, select, Table } from "effect-query-builder";
 import * as mysql from "effect-query-builder/mysql";
@@ -56,4 +56,110 @@ export const checkDialectTypes = () => {
   mysql.from(pgQuery.as("pg_documents"));
   // @ts-expect-error A PostgreSQL expression narrows a portable SELECT to PostgreSQL.
   pgQuery.compile("mysql");
+};
+
+const jsonRows = Table.fromSchema(
+  "json_rows",
+  Schema.Struct({
+    integer: Schema.NullOr(Schema.Int),
+    payload: Schema.Json,
+    text: Schema.NullOr(Schema.String),
+  })
+);
+
+const jsonbInteger = pg.jsonbGet(jsonRows.c.payload, "number", Schema.Int);
+
+const sqliteInteger = sqlite.jsonExtract(
+  documents.c.payload,
+  "$.number",
+  Schema.NumberFromString
+);
+
+const unknownEncoding = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.Int,
+    SchemaTransformation.transform<number, unknown>({
+      decode: Number,
+      encode: (value) => value,
+    })
+  )
+);
+
+const sqliteUnknown = sqlite.jsonExtract(
+  jsonRows.c.payload,
+  "$.number",
+  unknownEncoding
+);
+
+export const jsonbDecodedResult = pg
+  .from(jsonRows)
+  .select({ value: jsonbInteger });
+
+export const jsonbAssignment = pg
+  .update(jsonRows)
+  .set({ payload: jsonbInteger });
+
+export const sqliteTextCopy = sqlite
+  .insertInto(
+    Table.fromSchema(
+      "text_copy",
+      Schema.Struct({ value: Schema.NullOr(Schema.String) })
+    )
+  )
+  .fromSelect(sqlite.from(documents).select({ value: sqliteInteger }));
+
+const integerCopy = Table.fromSchema(
+  "integer_copy",
+  Schema.Struct({ value: Schema.NullOr(Schema.Int) })
+);
+
+export const rejectIncorrectJsonStorage = () => {
+  // @ts-expect-error PostgreSQL JSONB extraction returns JSONB to the database.
+  pg.update(jsonRows).set({ integer: jsonbInteger });
+  sqlite.insertInto(integerCopy).fromSelect(
+    // @ts-expect-error SQLite yields text before the extraction decoder runs.
+    sqlite.from(documents).select({ value: sqliteInteger })
+  );
+  // @ts-expect-error Unknown input to a decoder does not guarantee integer SQL storage.
+  sqlite.update(jsonRows).set({ integer: sqliteUnknown });
+};
+
+export const checkConditionalDialectTypes = (flag: boolean) => {
+  const portable = from(documents);
+  const operand = flag ? pgQuery : mysqlQuery;
+  const source = flag ? pgQuery.as("source") : mysqlQuery.as("source");
+
+  const projection:
+    | { matched: typeof pgPredicate }
+    | {
+        isObject: typeof sqlitePredicate;
+      } = flag ? { matched: pgPredicate } : { isObject: sqlitePredicate };
+
+  // @ts-expect-error A conditional SELECT source must work on PostgreSQL in both branches.
+  pg.from(source);
+  // @ts-expect-error A conditional set operand must work on PostgreSQL in both branches.
+  pgQuery.unionAll(operand);
+  // @ts-expect-error A conditional CTE must work on PostgreSQL in both branches.
+  pg.withCte("source", operand);
+  // @ts-expect-error A conditional INSERT source must work on PostgreSQL in both branches.
+  pg.insertInto(documents).fromSelect(operand);
+  // @ts-expect-error Both alternative projection shapes need a common dialect.
+  select(projection);
+  // @ts-expect-error Either branch of a predicate must work on PostgreSQL.
+  pg.from(documents).where(flag ? pgPredicate : sqlitePredicate);
+  // @ts-expect-error Either branch of a predicate must work on PostgreSQL.
+  pg.deleteFrom(documents).where(flag ? pgPredicate : sqlitePredicate);
+  // @ts-expect-error Either branch of a RETURNING projection must work on PostgreSQL.
+  pg.deleteFrom(documents).returning({
+    value: flag ? pgPredicate : sqlitePredicate,
+  });
+  // @ts-expect-error Either branch of SET must work on PostgreSQL.
+  pg.update(jsonRows).set({
+    text: flag
+      ? pg.jsonbText(jsonRows.c.payload, "v")
+      : sqlite.jsonType(jsonRows.c.payload),
+  });
+
+  pg.withCte("source", flag ? pgQuery : portable);
+  pg.from(flag ? pgQuery.as("source") : portable.as("source"));
 };

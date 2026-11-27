@@ -696,6 +696,25 @@ test("encodes duplicate-key patches for MySQL and keeps MariaDB INSERT RETURNING
   });
 });
 
+test("isolates a MySQL INSERT SELECT upsert source from its target", () => {
+  const counters = Table.fromSchema(
+    "__eqb_upsert_source",
+    Schema.Struct({ id: Schema.Int, value: Schema.Int })
+  );
+
+  const query = mysql
+    .insertInto(counters)
+    .fromSelect(mysql.from(counters).where(eq(counters.c.id, 1)))
+    .onDuplicateKeyUpdate(({ incoming, target }) => ({
+      value: add(target.c.value, incoming("value")),
+    }));
+
+  expect(Effect.runSync(query.compile("mysql"))).toEqual({
+    params: [1],
+    sql: "INSERT INTO `__eqb_upsert_source` (`id`, `value`) SELECT * FROM (SELECT `__eqb_upsert_source`.`id` AS `__eqb_0`, `__eqb_upsert_source`.`value` AS `__eqb_1` FROM `__eqb_upsert_source` WHERE (`__eqb_upsert_source`.`id` = ?)) AS `__eqb_upsert_source_1` ON DUPLICATE KEY UPDATE `value` = (`__eqb_upsert_source`.`value` + VALUES(`value`))",
+  });
+});
+
 test("distinguishes the incoming row from a table named excluded", () => {
   using database = new Database(":memory:");
   database.run(

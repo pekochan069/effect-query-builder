@@ -533,10 +533,13 @@ class Compiler<Raw> {
   #requireDialect(sql: string, ...dialects: readonly SqlDialect[]) {
     const dialect = this.#dialect;
 
-    if (
-      dialect !== undefined &&
-      (this.#profile === "portable" || !dialects.includes(dialect))
-    ) {
+    if (dialect === undefined) {
+      throw new UnsupportedDialectClauseError(
+        `Use toFragment(dialect) for ${sql}`
+      );
+    }
+
+    if (this.#profile === "portable" || !dialects.includes(dialect)) {
       throw new UnsupportedDialectClauseError(
         `${sql} is unsupported by the ${this.#profile} dialect profile`
       );
@@ -544,7 +547,13 @@ class Compiler<Raw> {
   }
 
   #requireClause(clause: ConditionalClause, sql: string) {
-    if (this.#profile !== undefined && !supportsClause(this.#profile, clause)) {
+    if (this.#profile === undefined) {
+      throw new UnsupportedDialectClauseError(
+        `Use toFragment(dialect) for ${sql}`
+      );
+    }
+
+    if (!supportsClause(this.#profile, clause)) {
       throw new UnsupportedDialectClauseError(
         `${sql} is unsupported by the ${this.#profile} dialect profile`
       );
@@ -722,6 +731,18 @@ class Compiler<Raw> {
 
     if (query.forUpdate === true) {
       this.#requireDialect("FOR UPDATE", "pg", "mysql");
+
+      if (
+        this.#dialect === "pg" &&
+        ((distinct !== undefined && distinct !== false) ||
+          query.groupBy !== undefined ||
+          query.having !== undefined)
+      ) {
+        throw new UnsupportedDialectClauseError(
+          "PostgreSQL FOR UPDATE requires a SELECT without DISTINCT, GROUP BY, or HAVING"
+        );
+      }
+
       this.#text(" FOR UPDATE");
     }
   }
@@ -841,7 +862,7 @@ class Compiler<Raw> {
     this.#text(") ");
 
     if ("select" in statement) {
-      this.#insertSelect(statement.select, statement.conflict !== undefined);
+      this.#insertSelect(statement);
     } else {
       this.#text("VALUES ");
       this.#list(statement.rows, (row) => {
@@ -858,18 +879,37 @@ class Compiler<Raw> {
     }
   }
 
-  #insertSelect(select: SelectStatement<Raw>, hasConflict: boolean) {
-    if (this.#dialect !== "sqlite" || !hasConflict) {
+  #insertSelect(
+    statement: Extract<InsertStatement<Raw>, { readonly select: unknown }>
+  ) {
+    const { conflict, select, table } = statement;
+    const dialect = this.#dialect;
+
+    if (
+      conflict === undefined ||
+      (dialect !== "sqlite" && dialect !== "mysql")
+    ) {
       this.#select(select);
-    } else if ((select.sets?.length ?? 0) === 0) {
+
+      return;
+    }
+
+    if (dialect === "sqlite" && (select.sets?.length ?? 0) === 0) {
       this.#select({
         ...select,
         where: select.where ?? { kind: "booleanLiteral", value: true },
       });
-    } else {
-      this.#text("SELECT * FROM ");
-      this.#subquery(select);
-      this.#alias("__eqb_upsert_source");
+
+      return;
+    }
+
+    const alias = "__eqb_upsert_source";
+
+    this.#text("SELECT * FROM ");
+    this.#subquery(select);
+    this.#alias(table.name.toLowerCase() === alias ? `${alias}_1` : alias);
+
+    if (dialect === "sqlite") {
       this.#text(" WHERE 1");
     }
   }

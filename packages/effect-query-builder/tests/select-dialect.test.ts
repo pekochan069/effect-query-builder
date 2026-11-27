@@ -5,7 +5,7 @@ import { Effect, Schema } from "effect";
 import { Reactivity } from "effect/reactivity";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 
-import { desc, eq, from, Table } from "../src/index.ts";
+import { alias, desc, eq, from, Table } from "../src/index.ts";
 import * as mysql from "../src/mysql.ts";
 import * as pg from "../src/pg.ts";
 import * as sqlite from "../src/sqlite.ts";
@@ -80,6 +80,23 @@ test("locks SELECT rows after ORDER BY and LIMIT in PostgreSQL and MySQL", () =>
   );
 });
 
+test("rejects PostgreSQL FOR UPDATE with DISTINCT, GROUP BY, or HAVING", () => {
+  const base = pg.from(documents).select({ id: documents.c.id });
+
+  const queries = [
+    base.distinct().forUpdate(),
+    base.distinctOn(documents.c.id).forUpdate(),
+    base.groupBy(documents.c.id).forUpdate(),
+    base.having(eq(documents.c.id, 1)).forUpdate(),
+  ];
+
+  for (const query of queries) {
+    expect(() => query.compile("pg")).toThrow(
+      "PostgreSQL FOR UPDATE requires a SELECT without DISTINCT, GROUP BY, or HAVING"
+    );
+  }
+});
+
 test("rejects a PostgreSQL query on a SQLite client before acquiring a connection", () => {
   const client = Effect.runSync(
     SqlClient.make({
@@ -116,5 +133,38 @@ test("rejects a PostgreSQL query on a SQLite client before acquiring a connectio
     "ILIKE is unsupported by the sqlite dialect profile",
     "DISTINCT ON is unsupported by the sqlite dialect profile",
     "FOR UPDATE is unsupported by the sqlite dialect profile",
+  ]);
+});
+
+test("requires an explicit dialect when interpolating a dialect-specific SELECT", () => {
+  const sql = Statement.make(
+    Effect.die("Offline constructor"),
+    Statement.makeCompilerSqlite(),
+    [],
+    undefined
+  );
+
+  const queries = [
+    mysql.from(documents),
+    from(documents).where(pg.ilike(documents.c.name, "d%")),
+    from(documents).fullJoin(
+      alias(documents, "other"),
+      ({ documents: left, other }) => eq(left.c.id, other.c.id)
+    ),
+  ];
+
+  for (const query of queries) {
+    expect(() => sql`SELECT * FROM (${query})`).toThrow(
+      "Use toFragment(dialect)"
+    );
+  }
+
+  const sqliteQuery = sqlite.from(documents).select({ id: documents.c.id });
+
+  expect(
+    sql`SELECT * FROM (${sqliteQuery.toFragment("sqlite")})`.compile()
+  ).toEqual([
+    'SELECT * FROM (SELECT "documents"."id" AS "__eqb_0" FROM "documents")',
+    [],
   ]);
 });

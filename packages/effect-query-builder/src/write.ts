@@ -360,7 +360,7 @@ interface InsertBuilder<
   readonly fromSelect: <Q extends QueryOperand>(
     query: Q &
       CheckInsertSelect<T["insert"], NoInfer<Q>> &
-      CheckDialect<D & OperandDialect<NoInfer<Q>>>
+      CheckDialect<D & NoInfer<OperandDialect<Q>>>
   ) => InsertQuery<T, D & OperandDialect<Q>, M, never>;
 }
 

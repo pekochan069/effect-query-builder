@@ -14,7 +14,7 @@ const OrderingTypeId = Symbol("effect-query-builder/Ordering");
 declare const ExpressionDialectTypeId: unique symbol;
 declare const ExpressionSqlValueTypeId: unique symbol;
 declare const ProjectedSqlValueTypeId: unique symbol;
-declare const UnknownRawSqlValue: unique symbol;
+declare const UnknownSqlValue: unique symbol;
 
 export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
@@ -86,10 +86,14 @@ export interface ProjectedSqlValue<Value> {
   readonly [ProjectedSqlValueTypeId]: Value;
 }
 
+type EncodedSqlValue<S extends Schema.Constraint> = unknown extends S["Encoded"]
+  ? typeof UnknownSqlValue
+  : S["Encoded"];
+
 export type SqlValue<Input> = Input extends Column
   ? Input["schema"]["Encoded"]
   : Input extends Expression<infer S, Column, SqlDialect, infer Value>
-    ? Value extends typeof UnknownRawSqlValue
+    ? Value extends typeof UnknownSqlValue
       ? unknown
       : unknown extends Value
         ? S["Type"]
@@ -458,7 +462,7 @@ export const jsonbGet = <
   return composeExpression<
     typeof nullable,
     readonly [Input],
-    (typeof nullable)["Type"],
+    Schema.Json,
     "pg"
   >(nullable, binary("->", input, key), [input]);
 };
@@ -511,7 +515,7 @@ const sqliteJson = <
   return composeExpression<
     typeof nullable,
     readonly [Input],
-    (typeof nullable)["Type"],
+    EncodedSqlValue<typeof nullable>,
     "sqlite"
   >(
     nullable,
@@ -724,12 +728,11 @@ export const raw = <S extends Schema.Constraint>(
   schema: S,
   fragment: Statement.Fragment
 ) =>
-  makeExpression<
-    S,
-    never,
-    SqlDialect,
-    unknown extends S["Encoded"] ? typeof UnknownRawSqlValue : S["Encoded"]
-  >(schema, toExpressionNode(fragment), []);
+  makeExpression<S, never, SqlDialect, EncodedSqlValue<S>>(
+    schema,
+    toExpressionNode(fragment),
+    []
+  );
 
 const ordering =
   (direction: Ordering["direction"]) =>

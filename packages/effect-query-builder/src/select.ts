@@ -132,24 +132,29 @@ type CheckFrom<P extends Selection, T extends Source> = [P] extends [never]
   ? unknown
   : CheckSelection<P, SourceEntry<T>>;
 
-type ExcludedSelectionDialects<Item> = Item extends Source
+type ExcludedSelectionItemDialects<Item> = Item extends Source
   ? Exclude<SqlDialect, SourceDialect<Item>>
   : Exclude<SqlDialect, ExpressionDialect<Item>>;
 
-type SelectionDialect<P extends Selection> = [P] extends [never]
-  ? SqlDialect
-  : P extends Source
-    ? SourceDialect<P>
-    : Exclude<SqlDialect, ExcludedSelectionDialects<P[keyof P]>>;
+type ExcludedSelectionDialects<P> = P extends Selection
+  ? P extends Source
+    ? ExcludedSelectionItemDialects<P>
+    : ExcludedSelectionItemDialects<P[keyof P]>
+  : never;
+
+type SelectionDialect<P extends Selection> = Exclude<
+  SqlDialect,
+  ExcludedSelectionDialects<P>
+>;
 
 type CheckExpression<Input, S extends Scope, D extends SqlDialect> = CheckInput<
   Input,
   S
 > &
-  CheckDialect<D & ExpressionDialect<NoInfer<Input>>>;
+  CheckDialect<D & NoInfer<ExpressionDialect<Input>>>;
 
 type CheckSource<T extends Source, D extends SqlDialect> = CheckDialect<
-  D & SourceDialect<NoInfer<T>>
+  D & NoInfer<SourceDialect<T>>
 >;
 
 type CheckJoin<
@@ -160,7 +165,7 @@ type CheckJoin<
 > = CheckExpression<
   On,
   S & SourceEntry<NoInfer<T>>,
-  D & SourceDialect<NoInfer<T>>
+  D & NoInfer<SourceDialect<T>>
 >;
 
 type NewSource<S extends Scope, T extends Source> = T &
@@ -195,12 +200,17 @@ export interface QueryOperand extends Effect.Effect<
 
 type OperandRow<Q extends QueryOperand> = Effect.Success<Q>[number];
 
-export type OperandDialect<Q extends QueryOperand> = Parameters<
-  Q["compile"]
->[0];
+type ExcludedOperandDialects<Q> = Q extends QueryOperand
+  ? Exclude<SqlDialect, Parameters<Q["compile"]>[0]>
+  : never;
+
+export type OperandDialect<Q extends QueryOperand> = Exclude<
+  SqlDialect,
+  ExcludedOperandDialects<Q>
+>;
 
 type CheckOperand<Q extends QueryOperand, D extends SqlDialect> = CheckDialect<
-  D & OperandDialect<NoInfer<Q>>
+  D & NoInfer<OperandDialect<Q>>
 >;
 
 type OperandSource<
@@ -380,7 +390,7 @@ export interface SelectQuery<
     selection: Scoped<
       Next &
         CheckSelection<Next, S> &
-        CheckDialect<D & SelectionDialect<NoInfer<Next>>>,
+        CheckDialect<D & NoInfer<SelectionDialect<Next>>>,
       S
     >
   ) => SelectQuery<S, Next, N, D, never, C>;
@@ -1208,7 +1218,7 @@ export interface SelectEntrypoints<D extends SqlDialect> {
     <const P extends Exclude<Selection, Source>>(
       selection: P &
         (Extract<keyof P, symbol> extends never ? unknown : never) &
-        CheckDialect<D & SelectionDialect<NoInfer<P>>>
+        CheckDialect<D & NoInfer<SelectionDialect<P>>>
     ): SelectQuery<EmptyScope, P, never, D>;
   };
   readonly withCte: <const Name extends string, Q extends QueryOperand>(

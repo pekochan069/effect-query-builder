@@ -118,9 +118,14 @@ export interface DerivedSource<
 
 export type Source = TableSource | DerivedSource;
 
-export type SourceDialect<T extends Source> = T extends DerivedSource
-  ? NonNullable<T[typeof DerivedTypeId]["dialect"]>
-  : SqlDialect;
+type ExcludedSourceDialects<T> = T extends DerivedSource
+  ? Exclude<SqlDialect, NonNullable<T[typeof DerivedTypeId]["dialect"]>>
+  : never;
+
+export type SourceDialect<T extends Source> = Exclude<
+  SqlDialect,
+  ExcludedSourceDialects<T>
+>;
 
 export type DerivedSelection<
   Name extends string,
