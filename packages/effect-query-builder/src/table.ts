@@ -6,7 +6,7 @@ import type {
   Extract as Variant,
   Struct as VariantStruct,
 } from "effect/schema/VariantSchema";
-import type { Statement } from "effect/sql";
+import type { SqlConnection, Statement } from "effect/sql";
 
 import { columnName, hasDuplicateColumnNames } from "./column-names.ts";
 import type { ColumnNaming } from "./column-names.ts";
@@ -39,6 +39,7 @@ type TableSchema<Name extends QualifiedName> = Name extends QualifiedName
   : never;
 
 const ColumnTypeId = Symbol("effect-query-builder/Column");
+const TableTypeId = Symbol("effect-query-builder/Table");
 
 export interface Column<
   Name extends QualifiedName = QualifiedName,
@@ -57,6 +58,9 @@ export interface Column<
   readonly default?: string;
   readonly generated: boolean;
 }
+
+export const isColumn = (value: unknown): value is Column =>
+  Predicate.hasProperty(value, ColumnTypeId);
 
 type Columns<
   Name extends QualifiedName,
@@ -152,6 +156,69 @@ type RowSchema = Schema.Constraint & {
   readonly fields: Schema.Struct.Fields;
 };
 
+export interface TableSource {
+  readonly [TableTypeId]: true;
+  readonly alias?: string;
+  readonly c: Readonly<Record<string, Column>>;
+  readonly identifier: QualifiedName;
+  readonly name: string;
+  readonly select: RowSchema;
+  readonly decodeRow: (
+    row: SqlConnection.Row
+  ) => Effect.Effect<unknown, Schema.SchemaError, unknown>;
+}
+
+export const isTableSource = (value: unknown): value is TableSource =>
+  Predicate.hasProperty(value, TableTypeId) && value[TableTypeId] === true;
+
+type AliasedColumns<Source extends TableSource, Alias extends string> = {
+  readonly [Key in keyof Source["c"]]: Source["c"][Key] extends Column
+    ? Column<
+        { readonly name: Alias },
+        Source["c"][Key]["key"],
+        Source["c"][Key]["schema"],
+        Source["c"][Key]["nullable"]
+      >
+    : never;
+};
+
+interface AliasedTable<
+  Source extends TableSource,
+  Alias extends string,
+> extends TableSource {
+  readonly alias: Alias;
+  readonly name: Alias;
+  readonly c: AliasedColumns<Source, Alias>;
+  readonly select: Source["select"];
+  readonly decodeRow: Source["decodeRow"];
+}
+
+export function alias<
+  const Source extends TableSource,
+  const Alias extends string,
+>(source: Source, name: Alias): AliasedTable<Source, Alias>;
+export function alias(source: TableSource, name: string) {
+  validateIdentifier(name);
+  const qualifier = Object.freeze({ name });
+
+  const c = Object.fromEntries(
+    Object.entries(source.c).map(([key, column]) => [
+      key,
+      Object.freeze({ ...column, [ColumnTypeId]: undefined, table: qualifier }),
+    ])
+  );
+
+  return Object.freeze<TableSource>({
+    [TableTypeId]: true,
+    alias: name,
+    c: Object.freeze(c),
+    decodeRow: source.decodeRow,
+    identifier: source.identifier,
+    name,
+    select: source.select,
+  });
+}
+
 type ModelInput = Pick<
   VariantStruct<VariantStruct.Fields>,
   typeof TypeId | "pipe"
@@ -192,6 +259,28 @@ const validateIdentifier = (identifier: string) => {
     throw new TypeError("SQL identifiers must be non-empty and contain no NUL");
   }
 };
+
+export const projectionColumn = (
+  source: string,
+  key: string,
+  name: string,
+  schema: Schema.Constraint
+) => {
+  const storage = inferColumnStorage(schema.ast);
+
+  return Object.freeze<Column>({
+    [ColumnTypeId]: undefined,
+    generated: false,
+    key,
+    name,
+    nullable: storage.nullable,
+    schema,
+    sqlType: storage.sqlType,
+    table: Object.freeze({ name: source }),
+  });
+};
+
+export { validateIdentifier };
 
 const fieldEntries = (fields: Schema.Struct.Fields) => {
   if (
@@ -400,6 +489,7 @@ const makeTable = <
   naming: ColumnNaming | undefined,
   options: TableOptions<ColumnKey<Fields>> | undefined
 ) => {
+  const tableName: Name["name"] = name.name;
   const { byKey, columns } = makeColumns(name, fields, naming, options);
 
   const physicalKeys = new Map(
@@ -429,13 +519,14 @@ const makeTable = <
   };
 
   return Object.freeze({
+    [TableTypeId]: true as const,
     c: byKey,
     constraints,
     decodeRow,
     encodeInsert: encode(insert),
     encodeUpdate: encode(update),
     identifier: name,
-    name: name.name,
+    name: tableName,
     select,
     selectRows: (statement: Statement.Statement<unknown>) =>
       flatMap(statement.withoutTransform, (rows) =>

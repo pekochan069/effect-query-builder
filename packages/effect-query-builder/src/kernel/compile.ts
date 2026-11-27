@@ -7,6 +7,7 @@ import type {
   SelectStatement,
   Statement,
 } from "./ast.ts";
+import { UnsupportedDialectClauseError } from "./errors.ts";
 import {
   projectionAlias,
   quoteWithDoubledDelimiter,
@@ -15,7 +16,7 @@ import {
 } from "./invariants.ts";
 import type { SqlToken } from "./invariants.ts";
 
-type SqlDialect = "pg" | "sqlite" | "mysql";
+export type SqlDialect = "pg" | "sqlite" | "mysql";
 
 type DialectProfile = SqlDialect | "portable" | "mariadb";
 
@@ -26,6 +27,11 @@ type WriteStatement = Extract<
 
 type ConditionalClause = "fullJoin" | `${WriteStatement["kind"]}Returning`;
 
+type CompilerToken<Raw> =
+  | SqlToken
+  | { readonly kind: "identifier"; readonly name: string }
+  | { readonly kind: "raw"; readonly value: Raw };
+
 const joinSql = {
   cross: "CROSS JOIN",
   full: "FULL OUTER JOIN",
@@ -34,18 +40,34 @@ const joinSql = {
   right: "RIGHT JOIN",
 } satisfies Record<Join["kind"], string>;
 
+const offsetOnlyLimit = {
+  pg: "",
+  portable: " LIMIT 9223372036854775807",
+  sqlite: " LIMIT -1",
+  mysql: " LIMIT 18446744073709551615",
+} satisfies Record<SqlDialect | "portable", string>;
+
 export type CompileTarget =
   | SqlDialect
   | { readonly dialect: SqlDialect; readonly compatibility: "portable" }
   | { readonly dialect: "mysql"; readonly mariadbReturning: boolean };
 
-class Compiler {
-  readonly #dialect: SqlDialect;
-  readonly #profile: DialectProfile;
-  readonly #tokens: SqlToken[] = [];
+class Compiler<Raw> {
+  readonly #dialect: SqlDialect | undefined;
+  readonly #profile: DialectProfile | undefined;
+  readonly #write: (token: CompilerToken<Raw>) => void;
 
-  constructor(target: CompileTarget) {
+  constructor(
+    target: CompileTarget | undefined,
+    write: (token: CompilerToken<Raw>) => void
+  ) {
+    this.#write = write;
+
     switch (target) {
+      case undefined: {
+        break;
+      }
+
       case "pg":
       case "sqlite":
       case "mysql": {
@@ -66,7 +88,11 @@ class Compiler {
     }
   }
 
-  compile(statement: Statement) {
+  get dialect() {
+    return this.#dialect;
+  }
+
+  compile(statement: Statement<Raw>) {
     switch (statement.kind) {
       case "select": {
         this.#select(statement);
@@ -106,12 +132,10 @@ class Compiler {
         throw new TypeError(`Unsupported statement: ${String(unhandled)}`);
       }
     }
-
-    return renderTokens(this.#tokens, this.#dialect === "pg");
   }
 
   #text(text: string) {
-    this.#tokens.push({ kind: "text", text });
+    this.#write({ kind: "text", text });
   }
 
   #list<T>(items: readonly T[], write: (item: T) => void) {
@@ -131,6 +155,18 @@ class Compiler {
       );
     }
 
+    if (this.#dialect === undefined) {
+      if (name.includes(".")) {
+        throw new TypeError(
+          "Use toFragment(dialect) for SQL identifiers containing dots"
+        );
+      }
+
+      this.#write({ kind: "identifier", name });
+
+      return;
+    }
+
     const delimiter = this.#dialect === "mysql" ? "`" : '"';
     this.#text(quoteWithDoubledDelimiter(name, delimiter));
   }
@@ -145,6 +181,12 @@ class Compiler {
   }
 
   #stringLiteral(value: string) {
+    if (this.#dialect === undefined) {
+      this.#write({ kind: "bind", value });
+
+      return;
+    }
+
     const hasBackslash = value.includes("\\");
     const hasNul = value.includes("\0");
 
@@ -154,7 +196,9 @@ class Compiler {
           byte.toString(16).padStart(2, "0")
         ).join("");
 
-        return `_utf8mb4 X'${hex}'`;
+        this.#text(`_utf8mb4 X'${hex}'`);
+
+        return;
       }
     } else if (hasNul) {
       throw new TypeError(
@@ -163,13 +207,25 @@ class Compiler {
     }
 
     if (this.#dialect === "pg" && hasBackslash) {
-      return `E${quoteWithDoubledDelimiter(value.replaceAll("\\", "\\\\"), "'")}`;
+      this.#text(
+        `E${quoteWithDoubledDelimiter(value.replaceAll("\\", "\\\\"), "'")}`
+      );
+
+      return;
     }
 
-    return quoteWithDoubledDelimiter(value, "'");
+    this.#text(quoteWithDoubledDelimiter(value, "'"));
   }
 
-  #expression(expression: Expression) {
+  #numberLiteral(value: number) {
+    if (!Number.isFinite(value)) {
+      throw new RangeError("Numeric SQL literals must be finite");
+    }
+
+    this.#text(String(value));
+  }
+
+  #expression(expression: Expression<Raw>) {
     switch (expression.kind) {
       case "column": {
         this.#qualifiedName({
@@ -181,23 +237,19 @@ class Compiler {
       }
 
       case "parameter": {
-        this.#tokens.push({ kind: "bind", value: expression.value });
+        this.#write({ kind: "bind", value: expression.value });
 
         return;
       }
 
       case "stringLiteral": {
-        this.#text(this.#stringLiteral(expression.value));
+        this.#stringLiteral(expression.value);
 
         return;
       }
 
       case "numberLiteral": {
-        if (!Number.isFinite(expression.value)) {
-          throw new RangeError("Numeric SQL literals must be finite");
-        }
-
-        this.#text(String(expression.value));
+        this.#numberLiteral(expression.value);
 
         return;
       }
@@ -250,6 +302,46 @@ class Compiler {
         return;
       }
 
+      case "in": {
+        this.#inPredicate(expression);
+
+        return;
+      }
+
+      case "between": {
+        this.#text("(");
+        this.#expression(expression.operand);
+        this.#text(" BETWEEN ");
+        this.#expression(expression.lower);
+        this.#text(" AND ");
+        this.#expression(expression.upper);
+        this.#text(")");
+
+        return;
+      }
+
+      case "aggregate": {
+        this.#aggregate(expression);
+
+        return;
+      }
+
+      case "caseWhen": {
+        this.#text("CASE WHEN ");
+        this.#expression(expression.condition);
+        this.#text(" THEN ");
+        this.#expression(expression.result);
+        this.#text(" END");
+
+        return;
+      }
+
+      case "raw": {
+        this.#write({ kind: "raw", value: expression.value });
+
+        return;
+      }
+
       default: {
         const unhandled: never = expression;
         throw new TypeError(`Unsupported expression: ${String(unhandled)}`);
@@ -257,9 +349,61 @@ class Compiler {
     }
   }
 
+  #inPredicate({
+    operand,
+    values,
+    negate,
+  }: Extract<Expression<Raw>, { kind: "in" }>) {
+    if (!("kind" in values) && values.length === 0) {
+      this.#text(negate === true ? "(1 = 1)" : "(1 = 0)");
+
+      return;
+    }
+
+    this.#text("(");
+    this.#expression(operand);
+    this.#text(negate === true ? " NOT IN " : " IN ");
+
+    if ("kind" in values) {
+      this.#subquery(values);
+    } else {
+      this.#text("(");
+      this.#list(values, (value) => {
+        this.#expression(value);
+      });
+      this.#text(")");
+    }
+
+    this.#text(")");
+  }
+
+  #aggregate({
+    name,
+    operand,
+    distinct,
+  }: Extract<Expression<Raw>, { kind: "aggregate" }>) {
+    this.#text(`${name}(`);
+
+    if (operand === undefined) {
+      if (name !== "COUNT" || distinct === true) {
+        throw new TypeError(`${name} requires an aggregate operand`);
+      }
+
+      this.#text("*");
+    } else {
+      if (distinct === true) {
+        this.#text("DISTINCT ");
+      }
+
+      this.#expression(operand);
+    }
+
+    this.#text(")");
+  }
+
   #projections(
-    projections: readonly Projection[],
-    orderBy?: SelectStatement["orderBy"]
+    projections: readonly Projection<Raw>[],
+    orderBy?: SelectStatement<Raw>["orderBy"]
   ) {
     const reserved = new Set<string>();
 
@@ -296,7 +440,11 @@ class Compiler {
     });
   }
 
-  #relation(relation: Relation) {
+  #relation(relation: Relation<Raw>) {
+    if (relation.presence !== undefined) {
+      this.#text("(");
+    }
+
     if (relation.kind === "table") {
       this.#qualifiedName(relation.name);
     } else {
@@ -304,20 +452,32 @@ class Compiler {
     }
 
     if (relation.alias !== undefined) {
-      this.#text(" AS ");
-      this.#identifier(relation.alias);
+      this.#alias(relation.alias);
+    }
+
+    if (relation.presence !== undefined) {
+      this.#text(" CROSS JOIN (SELECT 1 AS ");
+      this.#identifier(relation.presence);
+      this.#text(")");
+      this.#alias(relation.presence);
+      this.#text(")");
     }
   }
 
+  #alias(alias: string) {
+    this.#text(" AS ");
+    this.#identifier(alias);
+  }
+
   #requireClause(clause: ConditionalClause, sql: string) {
-    if (!supportsClause(this.#profile, clause)) {
-      throw new TypeError(
+    if (this.#profile !== undefined && !supportsClause(this.#profile, clause)) {
+      throw new UnsupportedDialectClauseError(
         `${sql} is unsupported by the ${this.#profile} dialect profile`
       );
     }
   }
 
-  #join(join: Join) {
+  #join(join: Join<Raw>) {
     const keyword = joinSql[join.kind];
 
     if (join.kind === "full") {
@@ -333,13 +493,16 @@ class Compiler {
     }
   }
 
-  #subquery(query: SelectStatement) {
+  #subquery(query: SelectStatement<Raw>) {
     this.#text("(");
     this.#select(query);
     this.#text(")");
   }
 
-  #predicate(clause: "WHERE" | "HAVING", expression: Expression | undefined) {
+  #predicate(
+    clause: "WHERE" | "HAVING",
+    expression: Expression<Raw> | undefined
+  ) {
     if (expression !== undefined) {
       this.#text(` ${clause} `);
       this.#expression(expression);
@@ -354,7 +517,7 @@ class Compiler {
     this.#text(` ${keyword} ${value}`);
   }
 
-  #groupOrOrderExpression(expression: Expression) {
+  #groupOrOrderExpression(expression: Expression<Raw>) {
     const isLiteral =
       expression.kind === "numberLiteral" ||
       expression.kind === "booleanLiteral" ||
@@ -372,7 +535,7 @@ class Compiler {
     }
   }
 
-  #select(query: SelectStatement) {
+  #select(query: SelectStatement<Raw>) {
     if (query.with !== undefined) {
       this.#text("WITH ");
       this.#list(query.with, (cte) => {
@@ -383,7 +546,25 @@ class Compiler {
       this.#text(" ");
     }
 
-    this.#text("SELECT ");
+    const sets = query.sets ?? [];
+
+    for (const _ of sets) {
+      this.#text("SELECT * FROM (");
+    }
+
+    this.#selectBody(query);
+
+    for (const { operator, query: right } of sets) {
+      this.#text(")");
+      this.#alias("__eqb_set_left");
+      this.#text(` ${operator} SELECT * FROM `);
+      this.#subquery(right);
+      this.#alias("__eqb_set_right");
+    }
+  }
+
+  #selectBody(query: SelectStatement<Raw>) {
+    this.#text(query.distinct === true ? "SELECT DISTINCT " : "SELECT ");
     this.#projections(query.projections, query.orderBy);
 
     if (query.from !== undefined) {
@@ -414,12 +595,16 @@ class Compiler {
       });
     }
 
-    if (query.limit !== undefined) {
-      this.#limitValue("LIMIT", query.limit.count);
+    const { limit, offset } = query;
 
-      if (query.limit.offset !== undefined) {
-        this.#limitValue("OFFSET", query.limit.offset);
-      }
+    if (limit !== undefined) {
+      this.#limitValue("LIMIT", limit);
+    } else if (offset !== undefined) {
+      this.#text(offsetOnlyLimit[this.#dialect ?? "portable"]);
+    }
+
+    if (offset !== undefined) {
+      this.#limitValue("OFFSET", offset);
     }
   }
 
@@ -493,5 +678,26 @@ class Compiler {
   }
 }
 
-export const compile = (target: CompileTarget, statement: Statement) =>
-  new Compiler(target).compile(statement);
+export const compile = (target: CompileTarget, statement: Statement) => {
+  const tokens: SqlToken[] = [];
+
+  const compiler = new Compiler<never>(target, (token) => {
+    if (token.kind === "raw" || token.kind === "identifier") {
+      throw new TypeError(`Unexpected token: ${token.kind}`);
+    }
+
+    tokens.push(token);
+  });
+
+  compiler.compile(statement);
+
+  return renderTokens(tokens, compiler.dialect === "pg");
+};
+
+export const renderSelect = <Raw>(
+  dialect: SqlDialect | undefined,
+  query: SelectStatement<Raw>,
+  write: (token: CompilerToken<Raw>) => void
+) => {
+  new Compiler(dialect, write).compile(query);
+};
