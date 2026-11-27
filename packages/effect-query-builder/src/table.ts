@@ -160,7 +160,6 @@ export interface TableSource {
   readonly [TableTypeId]: true;
   readonly alias?: string;
   readonly c: Readonly<Record<string, Column>>;
-  readonly constraints?: Pick<TableConstraints<string>, "primaryKey">;
   readonly identifier: QualifiedName;
   readonly name: string;
   readonly select: RowSchema;
@@ -213,7 +212,6 @@ export function alias(source: TableSource, name: string) {
     [TableTypeId]: true,
     alias: name,
     c: Object.freeze(c),
-    constraints: source.constraints,
     decodeRow: source.decodeRow,
     identifier: source.identifier,
     name,

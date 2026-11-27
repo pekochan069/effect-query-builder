@@ -9,7 +9,7 @@ import { projectionAlias } from "./kernel/invariants.ts";
 import { isDerivedSource, isSource } from "./select-source.ts";
 import type { Source } from "./select-source.ts";
 import { isColumn } from "./table.ts";
-import type { Column, TableSource } from "./table.ts";
+import type { Column } from "./table.ts";
 
 type SqlExpression = Node<Statement.Fragment>;
 
@@ -83,18 +83,6 @@ export interface ProjectionPlan {
   readonly fields: Readonly<Record<string, ProjectionField>>;
   readonly presence: ReadonlyMap<string, string>;
 }
-
-const primaryKeyMarker = (source: TableSource) => {
-  const primaryKey = source.constraints?.primaryKey;
-  const key = Predicate.isString(primaryKey) ? primaryKey : primaryKey?.[0];
-
-  const column =
-    key !== undefined && Object.hasOwn(source.c, key)
-      ? source.c[key]
-      : undefined;
-
-  return column?.nullable === false ? column.name : undefined;
-};
 
 const markerExpression: (
   operand: SqlExpression,
@@ -320,11 +308,10 @@ export const planProjection: (
       return cached;
     }
 
-    const key = isDerivedSource(source) ? undefined : primaryKeyMarker(source);
-    const table = key === undefined ? allocatePresence(source) : source.name;
+    const table = allocatePresence(source);
 
     const alias = add(
-      markerExpression({ kind: "column", name: key ?? table, table }, grouped),
+      markerExpression({ kind: "column", name: table, table }, grouped),
       { path, role: "presence" }
     );
 

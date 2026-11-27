@@ -214,6 +214,34 @@ test("preserves matches and raw columns when the physical table has an unmodeled
   ]);
 });
 
+test("decodes a matched row whose SQLite text primary key is null", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  database.run("CREATE TABLE files (code TEXT PRIMARY KEY, title TEXT)");
+  database.run("INSERT INTO files VALUES (NULL, 'readme')");
+
+  const files = Table.fromSchema(
+    "files",
+    Schema.Struct({
+      code: Schema.String,
+      title: Schema.OptionFromNullOr(Schema.String),
+    }),
+    { primaryKey: "code" }
+  );
+
+  const query = from(people)
+    .leftJoin(files, eq(people.c.id, 1))
+    .select({ id: people.c.id, title: files.c.title })
+    .orderBy(people.c.id);
+
+  expect(
+    Effect.runSync(query.pipe(Effect.provideService(SqlClient.SqlClient, sql)))
+  ).toEqual([
+    { id: 1, title: Option.some("readme") },
+    { id: 2, title: null },
+  ]);
+});
+
 test("deduplicates matched and unmatched SQL NULL for a null-preserving scalar", () => {
   using database = new Database(":memory:");
   const sql = fixture(database);
