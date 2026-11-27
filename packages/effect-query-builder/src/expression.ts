@@ -82,11 +82,8 @@ export interface ProjectedSqlValue<Value> {
   readonly [ProjectedSqlValueTypeId]: Value;
 }
 
-type ColumnSqlValue<S extends Schema.Constraint> =
-  S extends ProjectedSqlValue<infer Value> ? Value : S["Encoded"];
-
 export type SqlValue<Input> = Input extends Column
-  ? ColumnSqlValue<Input["schema"]>
+  ? Input["schema"]["Encoded"]
   : Input extends Expression<Schema.Constraint, Column, SqlDialect, infer Value>
     ? Value
     : Input extends Statement.Fragment

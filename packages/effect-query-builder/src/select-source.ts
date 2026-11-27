@@ -37,9 +37,10 @@ type ScalarFields<P> = P extends TableSource
 
 export type ScalarKey<P> = Extract<keyof ScalarFields<P>, string>;
 
-type FieldSqlValue<P, Key extends ScalarKey<P>> = SqlValue<
-  ScalarFields<P>[Key]
->;
+type FieldSqlValue<P, Key extends ScalarKey<P>> =
+  FieldSchema<P, Key> extends ProjectedSqlValue<infer Value>
+    ? Value
+    : SqlValue<ScalarFields<P>[Key]>;
 
 export type ScalarValue<P, Key extends ScalarKey<P>> = FieldSqlValue<
   P,
