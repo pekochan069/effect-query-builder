@@ -8,6 +8,7 @@ import type { SqlConnection } from "effect/sql";
 
 import {
   alias,
+  count,
   eq,
   from,
   gt,
@@ -164,6 +165,31 @@ test("composes CTEs with typed prior references, aliases, and bind order", () =>
   ).toEqual([{ left: "Lin", right: "Lin" }]);
 });
 
+test("groups a derived Option field without selecting an ungrouped presence column", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+
+  const joined = from(authors)
+    .leftJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ note: books.c.note })
+    .as("joined");
+
+  const query = from(joined)
+    .select({ note: joined.c.note, records: count() })
+    .groupBy(joined.c.note)
+    .orderBy(joined.c.note);
+
+  expect(query.compile("pg").sql).toContain(
+    'COUNT(CASE WHEN "joined"."__eqb_0" THEN 1 END)'
+  );
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([
+    { note: Option.none(), records: 2 },
+    { note: Option.some("reviewed"), records: 1 },
+  ]);
+});
+
 test("uses a named scalar subquery and decodes an empty scalar as null", () => {
   using db = new Database(":memory:");
 
@@ -256,6 +282,17 @@ test("carries restricted dialects through derived sources, joins, CTEs, and sets
   >();
   expect(joined.compile("sqlite").sql).toContain("FULL OUTER JOIN");
   expect(union.compile("pg").sql).toContain("FULL OUTER JOIN");
+});
+
+test("rejects set operands with incompatible encoded projections", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  const left = select({ value: raw(Schema.NumberFromString, sql`'42'`) });
+  const right = select({ value: raw(Schema.Int, sql`43`) });
+
+  expect(() => left.unionAll(right).compile("sqlite")).toThrow(
+    "Set operation operands must have compatible encoded projections"
+  );
 });
 
 test("rejects set operands whose fields use different shared presence markers", () => {

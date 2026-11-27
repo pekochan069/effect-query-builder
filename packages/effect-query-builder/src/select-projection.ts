@@ -1,4 +1,4 @@
-import { Array as Arr, Effect, Predicate, Schema } from "effect";
+import { Array as Arr, Effect, Predicate, Schema, SchemaAST } from "effect";
 import { forEach, map } from "effect/Effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
@@ -74,31 +74,15 @@ export interface ProjectionField {
 
 export interface ProjectionPlan {
   readonly columns: Arr.NonEmptyReadonlyArray<
-    Projection<Statement.Fragment> & { readonly alias: string }
+    Projection<Statement.Fragment> & {
+      readonly alias: string;
+      readonly slot: ProjectionSlot;
+    }
   >;
-  readonly layout: readonly ProjectionSlot[];
   readonly decode: Decode;
   readonly fields: Readonly<Record<string, ProjectionField>>;
   readonly presence: ReadonlyMap<string, string>;
 }
-
-const presenceColumn = (source: Source) => {
-  const names = new Set(
-    isDerivedSource(source)
-      ? source.plan.columns.map(({ alias }) => alias.toLowerCase())
-      : Object.values(source.c).map(({ name }) => name.toLowerCase())
-  );
-
-  let index = 0;
-  let marker = projectionAlias(index);
-
-  while (names.has(marker)) {
-    index += 1;
-    marker = projectionAlias(index);
-  }
-
-  return marker;
-};
 
 const primaryKeyMarker = (source: TableSource) => {
   const primaryKey = source.constraints?.primaryKey;
@@ -113,13 +97,10 @@ const primaryKeyMarker = (source: TableSource) => {
 };
 
 const markerExpression: (
-  source: Source,
-  name: string,
+  operand: SqlExpression,
   grouped: boolean
-) => SqlExpression = (source, name, grouped) => {
-  const operand = { kind: "column", name, table: source.name } as const;
-
-  return grouped
+) => SqlExpression = (operand, grouped) =>
+  grouped
     ? {
         kind: "binary",
         operator: ">",
@@ -127,6 +108,46 @@ const markerExpression: (
         right: { kind: "numberLiteral", value: 0 },
       }
     : { kind: "nullCheck", negate: true, operand };
+
+const inheritedMarker = (operand: SqlExpression, grouped: boolean) =>
+  grouped
+    ? markerExpression(
+        {
+          kind: "caseWhen",
+          condition: operand,
+          result: { kind: "numberLiteral", value: 1 },
+        },
+        true
+      )
+    : operand;
+
+const nonNullScalar = new Set<SchemaAST.AST["_tag"]>([
+  "BigInt",
+  "Boolean",
+  "Enum",
+  "Literal",
+  "Number",
+  "String",
+  "TemplateLiteral",
+]);
+
+const preservesNull = (ast: SchemaAST.AST) => {
+  if (ast.encoding !== undefined || ast.checks !== undefined) {
+    return false;
+  }
+
+  return (
+    ast._tag === "Null" ||
+    (ast._tag === "Union" &&
+      ast.types.some((part) => part._tag === "Null") &&
+      ast.types.every(
+        (part) =>
+          part.encoding === undefined &&
+          (part._tag === "Null"
+            ? part.checks === undefined
+            : nonNullScalar.has(part._tag))
+      ))
+  );
 };
 
 const missing = (row: SqlConnection.Row, marker: string | undefined) => {
@@ -152,10 +173,96 @@ const projectObject =
 type FieldPath = readonly string[];
 
 interface ProjectionSlot {
-  readonly role: string;
+  readonly role:
+    | "empty projection"
+    | "inherited presence"
+    | "presence"
+    | "value";
   readonly path: FieldPath;
-  readonly markers: readonly string[];
+  readonly markers?: readonly string[];
+  readonly encoding?: string;
 }
+
+const literalFamily = (value: SchemaAST.LiteralValue) => {
+  if (Predicate.isString(value)) {
+    return "string";
+  }
+
+  if (Predicate.isNumber(value)) {
+    return "number";
+  }
+
+  return Predicate.isBoolean(value) ? "boolean" : "bigint";
+};
+
+const encodedFamily: (ast: SchemaAST.AST) => string | undefined = (ast) => {
+  if (ast._tag === "Union") {
+    const branches = ast.types
+      .filter((part) => part._tag !== "Null")
+      .map(encodedFamily);
+
+    const known = branches.filter(Predicate.isString);
+
+    return known.length === branches.length
+      ? [...new Set(known)].toSorted().join("|")
+      : undefined;
+  }
+
+  if (ast._tag === "Literal") {
+    return literalFamily(ast.literal);
+  }
+
+  if (ast._tag === "Enum") {
+    return [...new Set(ast.enums.map(([, value]) => literalFamily(value)))]
+      .toSorted()
+      .join("|");
+  }
+
+  if (ast._tag === "TemplateLiteral") {
+    return "string";
+  }
+
+  return nonNullScalar.has(ast._tag) || ast._tag === "Null"
+    ? ast._tag.toLowerCase()
+    : undefined;
+};
+
+const requiresMarkers = (
+  marker: string | undefined,
+  inherited: readonly string[] = []
+) => (marker === undefined ? inherited : [...inherited, marker]);
+
+export const assertCompatibleProjections = (
+  left: ProjectionPlan,
+  right: ProjectionPlan
+) => {
+  const layout = (plan: ProjectionPlan) =>
+    plan.columns.map(({ slot: { role, path, markers } }) => [
+      role,
+      path,
+      markers ?? [],
+    ]);
+
+  if (JSON.stringify(layout(left)) !== JSON.stringify(layout(right))) {
+    throw new TypeError(
+      "Set operation operands must have the same SQL projection layout"
+    );
+  }
+
+  if (
+    left.columns.some(({ slot: { encoding } }, index) => {
+      const other = right.columns[index]?.slot.encoding;
+
+      return (
+        encoding !== undefined && other !== undefined && encoding !== other
+      );
+    })
+  ) {
+    throw new TypeError(
+      "Set operation operands must have compatible encoded projections"
+    );
+  }
+};
 
 const remapDecode: (
   decode: Decode,
@@ -175,20 +282,33 @@ export const planProjection: (
   grouped: boolean
 ) => ProjectionPlan = (selection, sources, nullable, grouped) => {
   const columns: ProjectionPlan["columns"][number][] = [];
-  const layout: ProjectionSlot[] = [];
   const presence = new Map<string, string>();
   const markerAliases = new Map<string, string>();
   const fields: [string, ProjectionField][] = [];
 
-  const add = (
-    expression: SqlExpression,
-    role: string,
-    path: FieldPath,
-    markers: readonly string[] = []
-  ) => {
+  const relationNames = new Set(
+    Object.keys(sources).map((key) => key.toLowerCase())
+  );
+
+  let markerIndex = 0;
+
+  const allocatePresence = (source: Source) => {
+    let name = `__eqb_presence_${markerIndex}`;
+
+    while (relationNames.has(name)) {
+      markerIndex += 1;
+      name = `__eqb_presence_${markerIndex}`;
+    }
+
+    markerIndex += 1;
+    presence.set(source.name, name);
+
+    return name;
+  };
+
+  const add = (expression: SqlExpression, slot: ProjectionSlot) => {
     const alias = projectionAlias(columns.length);
-    columns.push({ alias, expression });
-    layout.push({ markers, path, role });
+    columns.push({ alias, expression, slot });
 
     return alias;
   };
@@ -201,16 +321,11 @@ export const planProjection: (
     }
 
     const key = isDerivedSource(source) ? undefined : primaryKeyMarker(source);
-    const marker = key ?? presenceColumn(source);
-
-    if (key === undefined) {
-      presence.set(source.name, marker);
-    }
+    const table = key === undefined ? allocatePresence(source) : source.name;
 
     const alias = add(
-      markerExpression(source, marker, grouped),
-      "presence",
-      path
+      markerExpression({ kind: "column", name: key ?? table, table }, grouped),
+      { path, role: "presence" }
     );
 
     markerAliases.set(source.name, alias);
@@ -265,24 +380,28 @@ export const planProjection: (
         ])
       );
 
-      for (const [index, { alias }] of source.plan.columns.entries()) {
-        const slot = source.plan.layout[index];
-
-        if (slot === undefined) {
-          throw new TypeError("Derived SELECT lost a projection slot");
-        }
-
-        const markers = slot.markers.flatMap((input) => {
+      for (const { alias, slot } of source.plan.columns) {
+        const markers = slot.markers?.flatMap((input) => {
           const mapped = mapping.get(input);
 
           return mapped === undefined ? [] : [mapped];
         });
 
+        const column = {
+          kind: "column",
+          name: alias,
+          table: source.name,
+        } as const;
+
         add(
-          { kind: "column", name: alias, table: source.name },
-          slot.role,
-          [...path, ...slot.path],
-          marker === undefined ? markers : [...markers, marker]
+          slot.role === "presence" || slot.role === "inherited presence"
+            ? inheritedMarker(column, grouped)
+            : column,
+          {
+            ...slot,
+            path: [...path, ...slot.path],
+            markers: requiresMarkers(marker, markers),
+          }
         );
       }
 
@@ -304,12 +423,12 @@ export const planProjection: (
           return [];
         }
 
-        const alias = add(
-          toExpressionNode(column),
-          "value",
-          [...path, key],
-          marker === undefined ? [] : [marker]
-        );
+        const alias = add(toExpressionNode(column), {
+          encoding: encodedFamily(SchemaAST.toEncoded(column.schema.ast)),
+          markers: requiresMarkers(marker),
+          path: [...path, key],
+          role: "value",
+        });
 
         if (topLevel) {
           const decode = Schema.decodeUnknownEffect(column.schema);
@@ -346,7 +465,10 @@ export const planProjection: (
         ? sources[item.table.name]
         : undefined;
 
-    const marker = source === undefined ? undefined : findMarker(source, path);
+    const marker =
+      source === undefined || preservesNull(item.schema.ast)
+        ? undefined
+        : findMarker(source, path);
 
     if (isColumn(item) && isDerivedSource(source)) {
       const field = source.plan.fields[item.key];
@@ -362,9 +484,11 @@ export const planProjection: (
             [
               input,
               add(
-                { kind: "column", name: input, table: source.name },
-                "inherited presence",
-                path
+                inheritedMarker(
+                  { kind: "column", name: input, table: source.name },
+                  grouped
+                ),
+                { path, role: "inherited presence" }
               ),
             ] as const
         );
@@ -373,9 +497,12 @@ export const planProjection: (
 
       const alias = add(
         { kind: "column", name: field.alias, table: source.name },
-        "value",
-        path,
-        marker === undefined ? markers : [...markers, marker]
+        {
+          encoding: encodedFamily(SchemaAST.toEncoded(field.schema.ast)),
+          markers: requiresMarkers(marker, markers),
+          path,
+          role: "value",
+        }
       );
 
       const mapping = new Map([[field.alias, alias], ...inputs]);
@@ -389,12 +516,12 @@ export const planProjection: (
       isExpression(item) &&
       item.references.some((column) => nullable.has(column.table.name));
 
-    const alias = add(
-      toExpressionNode(item),
-      "value",
+    const alias = add(toExpressionNode(item), {
+      encoding: encodedFamily(SchemaAST.toEncoded(item.schema.ast)),
+      markers: requiresMarkers(marker),
       path,
-      marker === undefined ? [] : [marker]
-    );
+      role: "value",
+    });
 
     const decodeValue = Schema.decodeUnknownEffect(item.schema);
 
@@ -435,11 +562,11 @@ export const planProjection: (
         {
           expression: { kind: "numberLiteral", value: 1 },
           alias: projectionAlias(0),
+          slot: { path: [], role: "empty projection" },
         },
       ],
       decode,
       fields: Object.fromEntries(fields),
-      layout: [{ markers: [], path: [], role: "empty projection" }],
       presence,
     };
   }
@@ -448,7 +575,6 @@ export const planProjection: (
     columns,
     decode,
     fields: Object.fromEntries(fields),
-    layout,
     presence,
   };
 };

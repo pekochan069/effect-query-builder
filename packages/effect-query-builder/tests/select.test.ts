@@ -183,6 +183,87 @@ test("reuses filters via pipe while preserving a base query and accepting raw SQ
   ]);
 });
 
+test("preserves matches and raw columns when the physical table has an unmodeled alias", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  database.run("CREATE TABLE notes (body TEXT, __eqb_0 TEXT)");
+  database.run("INSERT INTO notes VALUES (NULL, NULL)");
+
+  const notes = alias(
+    Table.fromSchema(
+      "notes",
+      Schema.Struct({ body: Schema.OptionFromNullOr(Schema.String) })
+    ),
+    "__EQB_PRESENCE_0"
+  );
+
+  const query = from(people)
+    .leftJoin(notes, eq(people.c.id, 1))
+    .where(sql`"__EQB_PRESENCE_0"."__eqb_0" IS NULL`)
+    .select({ id: people.c.id, note: notes });
+
+  const rows = Effect.runSync(
+    query
+      .orderBy(people.c.id)
+      .pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  );
+
+  expect(rows).toEqual([
+    { id: 1, note: { body: Option.none() } },
+    { id: 2, note: null },
+  ]);
+});
+
+test("deduplicates matched and unmatched SQL NULL for a null-preserving scalar", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  database.run("CREATE TABLE notes (body TEXT)");
+  database.run("INSERT INTO notes VALUES (NULL)");
+
+  const notes = Table.fromSchema(
+    "notes",
+    Schema.Struct({ body: Schema.NullOr(Schema.String) })
+  );
+
+  const query = from(people)
+    .leftJoin(notes, eq(people.c.id, 1))
+    .select({ body: notes.c.body })
+    .distinct();
+
+  expect(
+    Effect.runSync(query.pipe(Effect.provideService(SqlClient.SqlClient, sql)))
+  ).toEqual([{ body: null }]);
+});
+
+test("rejects enumerable symbol projection keys", () => {
+  const projection = Object.defineProperty(
+    { id: people.c.id },
+    Symbol("extra"),
+    { enumerable: true, value: people.c.displayName }
+  );
+
+  expect(() => from(people).select(projection)).toThrow(
+    "SELECT projection keys cannot be symbols"
+  );
+});
+
+test("requires an explicit dialect for a dotted physical identifier in a template", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database).withoutTransforms();
+  database.run('CREATE TABLE "notes.v1" (id INTEGER)');
+  database.run('INSERT INTO "notes.v1" VALUES (1)');
+
+  const notes = Table.fromSchema("notes.v1", Schema.Struct({ id: Schema.Int }));
+  const query = from(notes);
+
+  expect(() => sql`SELECT * FROM (${query})`).toThrow(
+    "Use toFragment(dialect) for SQL identifiers containing dots"
+  );
+  expect(
+    Effect.runSync(sql`SELECT * FROM (${query.toFragment("sqlite")})`)
+  ).toEqual([{ __eqb_0: 1 }]);
+});
+
 test("supports cardinality, streaming, and native schema errors", () => {
   using database = new Database(":memory:");
   const sql = fixture(database);

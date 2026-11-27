@@ -77,6 +77,11 @@ export type Expression<Raw = never> =
       readonly distinct?: boolean;
     }
   | {
+      readonly kind: "caseWhen";
+      readonly condition: Expression<Raw>;
+      readonly result: Expression<Raw>;
+    }
+  | {
       readonly kind: "raw";
       readonly value: Raw;
     }

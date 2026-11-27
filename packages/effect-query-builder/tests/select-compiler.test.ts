@@ -132,16 +132,24 @@ test("marks present rows including null-only rows with quoted names", () => {
         alias: "present",
         expression: {
           kind: "column",
-          name: "present.marker",
-          table: 'posts."new`',
+          name: "present_marker",
+          table: "present_marker",
         },
       },
       {
         alias: "missing",
         expression: {
           kind: "column",
-          name: "present.marker",
-          table: "missing",
+          name: "missing_marker",
+          table: "missing_marker",
+        },
+      },
+      {
+        alias: "value",
+        expression: {
+          kind: "column",
+          name: "value.dot",
+          table: 'posts."new`',
         },
       },
     ],
@@ -149,7 +157,7 @@ test("marks present rows including null-only rows with quoted names", () => {
       relation: {
         kind: "table",
         name: { name: 'posts."new`' },
-        presence: "present.marker",
+        presence: "present_marker",
       },
       joins: [
         {
@@ -161,7 +169,7 @@ test("marks present rows including null-only rows with quoted names", () => {
               projections: [{ expression: { kind: "nullLiteral" } }],
             },
             alias: "missing",
-            presence: "present.marker",
+            presence: "missing_marker",
           },
           on: { kind: "booleanLiteral", value: false },
         },
@@ -170,12 +178,12 @@ test("marks present rows including null-only rows with quoted names", () => {
   };
 
   using db = new Database(":memory:");
-  db.run('CREATE TABLE "posts.""new`" (value INTEGER)');
+  db.run('CREATE TABLE "posts.""new`" ("value.dot" INTEGER)');
   db.run('INSERT INTO "posts.""new`" VALUES (NULL)');
   expect(db.query(compileSelect(query, "sqlite").sql).all()).toEqual([
-    { missing: null, present: 1 },
+    { missing: null, present: 1, value: null },
   ]);
   expect(compileSelect(query, "mysql").sql).toContain(
-    '`posts."new```.`present.marker`'
+    '`posts."new```.`value.dot`'
   );
 });

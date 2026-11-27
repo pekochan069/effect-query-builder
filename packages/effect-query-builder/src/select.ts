@@ -33,7 +33,10 @@ import type {
 } from "./kernel/ast.ts";
 import { compileSelect, toSelectFragment } from "./select-compiler.ts";
 import type { SelectDialect } from "./select-compiler.ts";
-import { planProjection } from "./select-projection.ts";
+import {
+  assertCompatibleProjections,
+  planProjection,
+} from "./select-projection.ts";
 import type {
   DecodeServices,
   ProjectionPlan,
@@ -95,7 +98,11 @@ type CheckSelectionItem<Item, S extends Scope> = Item extends Source
   : CheckInput<Item, S>;
 
 type InvalidSelection<P extends Selection, S extends Scope> = {
-  [K in keyof P]: CheckSelectionItem<P[K], S> extends never ? K : never;
+  [K in keyof P]: K extends symbol
+    ? K
+    : CheckSelectionItem<P[K], S> extends never
+      ? K
+      : never;
 }[keyof P];
 
 type CheckSelection<P extends Selection, S extends Scope> = P extends Source
@@ -497,8 +504,22 @@ const supportedDialects: (mysql: boolean) => readonly SelectDialect[] = (
   mysql
 ) => (mysql ? ["pg", "sqlite", "mysql"] : ["pg", "sqlite"]);
 
-const copySelection = (selection: Selection) =>
-  isSource(selection) ? selection : Object.freeze({ ...selection });
+const copySelection = (selection: Selection) => {
+  if (isSource(selection)) {
+    return selection;
+  }
+
+  if (
+    Object.getOwnPropertySymbols(selection).some(
+      (key) =>
+        Object.getOwnPropertyDescriptor(selection, key)?.enumerable === true
+    )
+  ) {
+    throw new TypeError("SELECT projection keys cannot be symbols");
+  }
+
+  return Object.freeze({ ...selection });
+};
 
 class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   static {
@@ -838,13 +859,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       orderBy: Arr.isReadonlyArrayNonEmpty(orderBy) ? orderBy : undefined,
       projections: plan.columns,
       sets: sets.map(({ operand, operator }) => {
-        if (
-          JSON.stringify(plan.layout) !== JSON.stringify(operand.plan.layout)
-        ) {
-          throw new TypeError(
-            "Set operation operands must have the same SQL projection layout"
-          );
-        }
+        assertCompatibleProjections(plan, operand.plan);
 
         return { operator, query: operand.ast };
       }),
@@ -965,7 +980,7 @@ export function select<const T extends Source>(
   selection: T
 ): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
 export function select<const P extends Exclude<Selection, Source>>(
-  selection: P
+  selection: P & (Extract<keyof P, symbol> extends never ? unknown : never)
 ): SelectQuery<EmptyScope, P>;
 export function select(selection: Selection) {
   const query = new Query(empty);

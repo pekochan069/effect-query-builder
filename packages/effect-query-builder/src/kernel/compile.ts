@@ -155,6 +155,12 @@ class Compiler<Raw> {
     }
 
     if (this.#dialect === undefined) {
+      if (name.includes(".")) {
+        throw new TypeError(
+          "Use toFragment(dialect) for SQL identifiers containing dots"
+        );
+      }
+
       this.#write({ kind: "identifier", name });
 
       return;
@@ -210,6 +216,14 @@ class Compiler<Raw> {
     this.#text(quoteWithDoubledDelimiter(value, "'"));
   }
 
+  #numberLiteral(value: number) {
+    if (!Number.isFinite(value)) {
+      throw new RangeError("Numeric SQL literals must be finite");
+    }
+
+    this.#text(String(value));
+  }
+
   #expression(expression: Expression<Raw>) {
     switch (expression.kind) {
       case "column": {
@@ -234,11 +248,7 @@ class Compiler<Raw> {
       }
 
       case "numberLiteral": {
-        if (!Number.isFinite(expression.value)) {
-          throw new RangeError("Numeric SQL literals must be finite");
-        }
-
-        this.#text(String(expression.value));
+        this.#numberLiteral(expression.value);
 
         return;
       }
@@ -311,6 +321,16 @@ class Compiler<Raw> {
 
       case "aggregate": {
         this.#aggregate(expression);
+
+        return;
+      }
+
+      case "caseWhen": {
+        this.#text("CASE WHEN ");
+        this.#expression(expression.condition);
+        this.#text(" THEN ");
+        this.#expression(expression.result);
+        this.#text(" END");
 
         return;
       }
@@ -421,9 +441,7 @@ class Compiler<Raw> {
 
   #relation(relation: Relation<Raw>) {
     if (relation.presence !== undefined) {
-      this.#text("(SELECT *, 1 AS ");
-      this.#identifier(relation.presence);
-      this.#text(" FROM ");
+      this.#text("(");
     }
 
     if (relation.kind === "table") {
@@ -432,18 +450,16 @@ class Compiler<Raw> {
       this.#subquery(relation.query);
     }
 
-    if (relation.presence !== undefined) {
-      if (relation.kind === "subquery") {
-        this.#alias("__eqb_presence");
-      }
-
-      this.#text(")");
-      this.#alias(
-        relation.alias ??
-          (relation.kind === "table" ? relation.name.name : relation.alias)
-      );
-    } else if (relation.alias !== undefined) {
+    if (relation.alias !== undefined) {
       this.#alias(relation.alias);
+    }
+
+    if (relation.presence !== undefined) {
+      this.#text(" CROSS JOIN (SELECT 1 AS ");
+      this.#identifier(relation.presence);
+      this.#text(")");
+      this.#alias(relation.presence);
+      this.#text(")");
     }
   }
 
