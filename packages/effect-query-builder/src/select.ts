@@ -46,6 +46,7 @@ import type {
   Selection,
 } from "./select-projection.ts";
 import {
+  derivedDefinition,
   isDerivedSource,
   isSource,
   makeDerivedSource,
@@ -498,16 +499,18 @@ const relation: (
     };
   }
 
-  if (source.relation.kind === "subquery") {
+  const { relation: definition } = derivedDefinition(source);
+
+  if (definition.kind === "subquery") {
     return {
       alias: source.name,
       kind: "subquery",
       presence,
-      query: source.relation.query,
+      query: definition.query,
     };
   }
 
-  const { name } = source.relation;
+  const { name } = definition;
 
   return {
     alias: name === source.name ? undefined : source.name,
@@ -518,11 +521,7 @@ const relation: (
 };
 
 const supportsMysql = (source: Source) =>
-  !isDerivedSource(source) || source.dialects.includes("mysql");
-
-const supportedDialects: (mysql: boolean) => readonly SelectDialect[] = (
-  mysql
-) => (mysql ? ["pg", "sqlite", "mysql"] : ["pg", "sqlite"]);
+  !isDerivedSource(source) || derivedDefinition(source).mysql;
 
 const unsupportedSelect = (message: string, cause: unknown = message) =>
   Effect.fail(
@@ -599,12 +598,11 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   as(name: string) {
-    return makeDerivedSource(
-      name,
-      this.#plan(),
-      { kind: "subquery", query: this.#ast() },
-      supportedDialects(this.#state.mysql)
-    );
+    return makeDerivedSource(name, {
+      mysql: this.#state.mysql,
+      plan: this.#plan(),
+      relation: { kind: "subquery", query: this.#ast() },
+    });
   }
 
   scalar(key: string) {
@@ -635,12 +633,11 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     const { ctes, mysql, with: previous } = this.#state;
     const query = resolve(operand, ctes)[QueryTypeId]();
 
-    const source = makeDerivedSource(
-      name,
-      query.plan,
-      { kind: "cte", name },
-      supportedDialects(query.mysql)
-    );
+    const source = makeDerivedSource(name, {
+      mysql: query.mysql,
+      plan: query.plan,
+      relation: { kind: "cte", name },
+    });
 
     return this.#copy({
       ctes: addSource(ctes, source),

@@ -56,11 +56,8 @@ export type ScalarSchema<P, Key extends ScalarKey<P>, Row> = Schema.NullOr<
   ProjectedSchema<P, Key, Row>
 >;
 
-interface DerivedSourceBase {
-  readonly [DerivedTypeId]: true;
-  readonly name: string;
-  readonly c: Readonly<Record<string, Column>>;
-  readonly dialects: readonly SelectDialect[];
+interface DerivedDefinition {
+  readonly mysql: boolean;
   readonly plan: ProjectionPlan;
   readonly relation:
     | { readonly kind: "cte"; readonly name: string }
@@ -78,10 +75,10 @@ export interface DerivedSource<
   Row = unknown,
   R = unknown,
   Dialect extends SelectDialect = SelectDialect,
-> extends DerivedSourceBase {
+> {
+  readonly [DerivedTypeId]: DerivedDefinition & { readonly dialect?: Dialect };
   readonly name: Name;
   readonly c: Columns;
-  readonly dialects: readonly Dialect[];
   readonly decodeRow: (
     row: SqlConnection.Row
   ) => Effect.Effect<Row, Schema.SchemaError, R>;
@@ -90,7 +87,7 @@ export interface DerivedSource<
 export type Source = TableSource | DerivedSource;
 
 export type SourceDialect<T extends Source> = T extends DerivedSource
-  ? T["dialects"][number]
+  ? NonNullable<T[typeof DerivedTypeId]["dialect"]>
   : SelectDialect;
 
 export type DerivedSelection<
@@ -114,18 +111,21 @@ export type DerivedSelection<
 >;
 
 export const isDerivedSource = <T>(value: T): value is T & DerivedSource =>
-  Predicate.hasProperty(value, DerivedTypeId) && value[DerivedTypeId] === true;
+  Predicate.hasProperty(value, DerivedTypeId);
+
+export const derivedDefinition = (source: DerivedSource) =>
+  source[DerivedTypeId];
 
 export const isSource = (value: unknown): value is Source =>
   isTableSource(value) || isDerivedSource(value);
 
 export const makeDerivedSource = (
   name: string,
-  plan: ProjectionPlan,
-  relation: DerivedSource["relation"],
-  dialects: readonly SelectDialect[]
+  definition: DerivedDefinition
 ) => {
   validateIdentifier(name);
+
+  const { plan } = definition;
 
   const c = Object.fromEntries(
     Object.entries(plan.fields).map(([key, field]) => [
@@ -140,13 +140,10 @@ export const makeDerivedSource = (
   );
 
   return Object.freeze<DerivedSource>({
-    [DerivedTypeId]: true,
+    [DerivedTypeId]: Object.freeze(definition),
     c: Object.freeze(c),
     decodeRow: plan.decode,
-    dialects,
     name,
-    plan,
-    relation,
   });
 };
 
@@ -167,7 +164,7 @@ type AliasedDerived<
   },
   Effect.Success<ReturnType<S["decodeRow"]>>,
   Effect.Services<ReturnType<S["decodeRow"]>>,
-  S["dialects"][number]
+  SourceDialect<S>
 >;
 
 export function alias<const S extends DerivedSource, const Name extends string>(
@@ -180,6 +177,6 @@ export function alias<const S extends TableSource, const Name extends string>(
 ): ReturnType<typeof aliasTable<S, Name>>;
 export function alias(source: Source, name: string) {
   return isDerivedSource(source)
-    ? makeDerivedSource(name, source.plan, source.relation, source.dialects)
+    ? makeDerivedSource(name, derivedDefinition(source))
     : aliasTable(source, name);
 }

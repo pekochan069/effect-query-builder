@@ -6,7 +6,11 @@ import { isExpression, toExpressionNode } from "./expression.ts";
 import type { Expression } from "./expression.ts";
 import type { Expression as Node, Projection } from "./kernel/ast.ts";
 import { projectionAlias } from "./kernel/invariants.ts";
-import { isDerivedSource, isSource } from "./select-source.ts";
+import {
+  derivedDefinition,
+  isDerivedSource,
+  isSource,
+} from "./select-source.ts";
 import type { Source } from "./select-source.ts";
 import { isColumn } from "./table.ts";
 import type { Column } from "./table.ts";
@@ -358,16 +362,17 @@ export const planProjection: (
     const topLevel = path.length === 0;
 
     if (isDerivedSource(source)) {
+      const { plan } = derivedDefinition(source);
       const start = columns.length;
 
       const mapping = new Map(
-        source.plan.columns.map(({ alias }, index) => [
+        plan.columns.map(({ alias }, index) => [
           alias,
           projectionAlias(start + index),
         ])
       );
 
-      for (const { alias, slot } of source.plan.columns) {
+      for (const { alias, slot } of plan.columns) {
         const markers = slot.markers?.flatMap((input) => {
           const mapped = mapping.get(input);
 
@@ -393,7 +398,7 @@ export const planProjection: (
       }
 
       if (topLevel) {
-        for (const [key, field] of Object.entries(source.plan.fields)) {
+        for (const [key, field] of Object.entries(plan.fields)) {
           fields.push([key, forwardField(field, mapping, marker)]);
         }
       }
@@ -458,7 +463,7 @@ export const planProjection: (
         : findMarker(source, path);
 
     if (isColumn(item) && isDerivedSource(source)) {
-      const field = source.plan.fields[item.key];
+      const field = derivedDefinition(source).plan.fields[item.key];
 
       if (field === undefined) {
         throw new TypeError(`Unknown derived SELECT column: ${item.key}`);
