@@ -22,6 +22,7 @@ import {
   Table,
   withCte,
 } from "../src/index.ts";
+import type { Expression } from "../src/index.ts";
 
 const authors = Table.fromSchema(
   "authors",
@@ -281,6 +282,21 @@ test("compares scalar subqueries and extrema using the operands' SQL values", ()
   const { note, authorId } = books.c;
   const selectedId = from(branded).where(eq(id, 2)).scalar("id");
   const selectedNote = from(books).where(eq(authorId, 2)).scalar("note");
+  const minimumNote = min(note);
+
+  expectTypeOf<
+    typeof selectedNote extends Expression<typeof selectedNote.schema, never>
+      ? true
+      : false
+  >().toEqualTypeOf<true>();
+  expectTypeOf<
+    typeof minimumNote extends Expression<
+      typeof minimumNote.schema,
+      typeof note
+    >
+      ? true
+      : false
+  >().toEqualTypeOf<true>();
 
   const brandedMatch = from(branded)
     .where(eq(id, selectedId))
@@ -291,7 +307,7 @@ test("compares scalar subqueries and extrema using the operands' SQL values", ()
   const optionalMatch = from(books)
     .where(eq(note, selectedNote))
     .where(eq(selectedNote, note))
-    .select({ minimum: eq(note, min(note)), maximum: eq(max(note), note) })
+    .select({ minimum: eq(note, minimumNote), maximum: eq(max(note), note) })
     .groupBy(note);
 
   const provided = Effect.provideService(SqlClient.SqlClient, sql);
@@ -589,6 +605,81 @@ test("preserves bigint transport decoding through derived set results", () => {
       scalar: [{ middle: 2 }],
     })
   );
+});
+
+test("decodes decimal text in promoted numeric set results", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  const total = from(books).select({ value: count() });
+
+  const combined = select({
+    value: raw(Schema.Int, sql`'3.0000000000000000'`),
+  }).unionAll(total);
+
+  const derived = combined.as("decimal_values");
+  const run = Effect.provideService(SqlClient.SqlClient, sql);
+
+  expect(Effect.runSync(combined.pipe(run, Effect.exit))).toEqual(
+    Exit.succeed([{ value: 3 }, { value: 2 }])
+  );
+  expect(
+    Effect.runSync(
+      from(derived)
+        .select({
+          scalar: from(derived)
+            .orderBy(desc(derived.c.value))
+            .limit(1)
+            .scalar("value"),
+          minimum: min(derived.c.value),
+          maximum: max(derived.c.value),
+        })
+        .pipe(run, Effect.exit)
+    )
+  ).toEqual(Exit.succeed([{ scalar: 3, minimum: 2, maximum: 3 }]));
+
+  const fractional = select({
+    value: raw(Schema.Number, sql`'2.5'`),
+  }).unionAll(total);
+
+  expect(Effect.runSync(fractional.pipe(run, Effect.exit))).toEqual(
+    Exit.succeed([{ value: 2.5 }, { value: 2 }])
+  );
+});
+
+test("rejects unsafe or malformed promoted numeric text through the original codec", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  const total = from(books).select({ value: count() });
+  const run = Effect.provideService(SqlClient.SqlClient, sql);
+
+  for (const text of [
+    "1.0000000000000001",
+    "9007199254740993.0",
+    "0x10",
+    "2.5",
+  ]) {
+    const combined = select({ value: raw(Schema.Int, sql`${text}`) }).unionAll(
+      total
+    );
+
+    const derived = combined.as("decimal_values");
+
+    const scalar = select({
+      value: from(derived)
+        .orderBy(desc(derived.c.value))
+        .limit(1)
+        .scalar("value"),
+    });
+
+    for (const query of [combined, scalar]) {
+      const error = Effect.runSync(query.pipe(run, Effect.result)).pipe(
+        Result.getFailure,
+        Option.getOrUndefined
+      );
+
+      expect(error).toBeInstanceOf(Schema.SchemaError);
+    }
+  }
 });
 
 test("limits bigint normalization to safe integers in the promoted result fields", () => {

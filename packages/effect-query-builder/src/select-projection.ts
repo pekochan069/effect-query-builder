@@ -4,9 +4,10 @@ import { forEach, map } from "effect/Effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
 import {
-  bigintResultSchema,
   expressionSqlFamily,
   isExpression,
+  numericResultSchema,
+  numericTransportNumber,
   toExpressionNode,
 } from "./expression.ts";
 import type { Expression } from "./expression.ts";
@@ -189,7 +190,7 @@ interface ProjectionSlot {
   readonly markers?: readonly string[];
   readonly encoding?: string;
   readonly booleanCodec?: "predicate" | "bit";
-  readonly bigintTransport?: true;
+  readonly numericTransport?: true;
 }
 
 const literalFamily = (value: SchemaAST.LiteralValue) => {
@@ -238,13 +239,13 @@ const encodedFamily: (ast: SchemaAST.AST) => string | undefined = (ast) => {
 
 const projectionEncoding: (
   schema: Schema.Constraint
-) => Pick<ProjectionSlot, "encoding" | "booleanCodec" | "bigintTransport"> = (
+) => Pick<ProjectionSlot, "encoding" | "booleanCodec" | "numericTransport"> = (
   schema
 ) => {
   const family = expressionSqlFamily(schema.ast);
 
   if (family === "number") {
-    return { bigintTransport: true, encoding: family };
+    return { numericTransport: true, encoding: family };
   }
 
   const encoding = encodedFamily(SchemaAST.toEncoded(schema.ast));
@@ -271,7 +272,7 @@ const requiresMarkers = (
 
 type ProjectionColumn = ProjectionPlan["columns"][number];
 
-const normalizeBigInts = (
+const normalizeNumbers = (
   row: SqlConnection.Row,
   aliases: Iterable<string>
 ) => {
@@ -280,13 +281,15 @@ const normalizeBigInts = (
   for (const alias of aliases) {
     const value = row[alias];
 
-    if (Predicate.isBigInt(value)) {
-      const number = Number(value);
+    if (!Predicate.isBigInt(value) && !Predicate.isString(value)) {
+      continue;
+    }
 
-      if (Number.isSafeInteger(number)) {
-        mapped ??= { ...row };
-        mapped[alias] = number;
-      }
+    const number = numericTransportNumber(value);
+
+    if (number !== null) {
+      mapped ??= { ...row };
+      mapped[alias] = number;
     }
   }
 
@@ -300,7 +303,7 @@ export const withNumericSetTransport: (
   const promotedPaths = new Set(
     operands.flatMap(({ columns }) =>
       columns
-        .filter(({ slot }) => slot.bigintTransport)
+        .filter(({ slot }) => slot.numericTransport)
         .map(({ slot }) => JSON.stringify(slot.path))
     )
   );
@@ -308,7 +311,7 @@ export const withNumericSetTransport: (
   const promotedAliases = new Set(
     plan.columns.flatMap(({ alias, slot }) =>
       slot.encoding === "number" &&
-      !slot.bigintTransport &&
+      !slot.numericTransport &&
       promotedPaths.has(JSON.stringify(slot.path))
         ? [alias]
         : []
@@ -323,13 +326,13 @@ export const withNumericSetTransport: (
 
   const promoteColumn = (column: ProjectionColumn) =>
     promotedAliases.has(column.alias)
-      ? { ...column, slot: { ...column.slot, bigintTransport: true } as const }
+      ? { ...column, slot: { ...column.slot, numericTransport: true } as const }
       : column;
 
   return {
     ...plan,
     columns: [promoteColumn(first), ...rest.map(promoteColumn)],
-    decode: (row) => plan.decode(normalizeBigInts(row, promotedAliases)),
+    decode: (row) => plan.decode(normalizeNumbers(row, promotedAliases)),
     fields: Object.fromEntries(
       Object.entries(plan.fields).map(([key, field]) => [
         key,
@@ -337,8 +340,8 @@ export const withNumericSetTransport: (
           ? {
               ...field,
               decode: (row: SqlConnection.Row) =>
-                field.decode(normalizeBigInts(row, [field.alias])),
-              resultSchema: bigintResultSchema(field.schema),
+                field.decode(normalizeNumbers(row, [field.alias])),
+              resultSchema: numericResultSchema(field.schema),
             }
           : field,
       ])

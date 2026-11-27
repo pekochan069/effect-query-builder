@@ -18,7 +18,7 @@ export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
   Refs extends Column = Column,
   Dialect extends SqlDialect = SqlDialect,
-  Value = S["Type"],
+  Value = unknown,
 > {
   readonly [ExpressionTypeId]: true;
   readonly [ExpressionDialectTypeId]?: Dialect;
@@ -84,8 +84,10 @@ export interface ProjectedSqlValue<Value> {
 
 export type SqlValue<Input> = Input extends Column
   ? Input["schema"]["Encoded"]
-  : Input extends Expression<Schema.Constraint, Column, SqlDialect, infer Value>
-    ? Value
+  : Input extends Expression<infer S, Column, SqlDialect, infer Value>
+    ? unknown extends Value
+      ? S["Type"]
+      : Value
     : Input extends Statement.Fragment
       ? unknown
       : Input;
@@ -157,10 +159,60 @@ export const expressionSqlFamily: (
     : undefined;
 };
 
-export const bigintResultSchema = (schema: Schema.Constraint) => {
+const decimalText = /^-?\d+(?:\.(?<fraction>\d+))?$/u;
+const nonzeroDigit = /[1-9]/u;
+
+const decimalTransportNumber = (text: string) => {
+  const match = decimalText.exec(text);
+
+  if (match === null) {
+    return null;
+  }
+
+  const number = Number(text);
+
+  if (!Number.isFinite(number)) {
+    return null;
+  }
+
+  if (Number.isInteger(number)) {
+    const fraction = match.groups?.fraction;
+
+    if (
+      !Number.isSafeInteger(number) ||
+      (fraction !== undefined && nonzeroDigit.test(fraction))
+    ) {
+      return null;
+    }
+  }
+
+  return number;
+};
+
+export const numericTransportNumber = (value: bigint | string) => {
+  if (Predicate.isBigInt(value)) {
+    const number = Number(value);
+
+    return Number.isSafeInteger(number) ? number : null;
+  }
+
+  return decimalTransportNumber(value);
+};
+
+const numberFromDecimalText = Schema.String.check(
+  Schema.makeFilter((value) => decimalTransportNumber(value) !== null)
+).pipe(
+  Schema.decodeTo(
+    Schema.Finite,
+    SchemaTransformation.transform({ decode: Number, encode: String })
+  )
+);
+
+export const numericResultSchema = (schema: Schema.Constraint) => {
   const result = Schema.Union([
     schema,
     integerFromBigInt.pipe(Schema.decodeTo(schema)),
+    numberFromDecimalText.pipe(Schema.decodeTo(schema)),
   ]);
 
   expressionFamilies.set(result.ast, "number");
@@ -472,14 +524,20 @@ interface AggregateOptions {
   readonly distinct?: boolean;
 }
 
-export function count(): Expression<typeof countSchema, never>;
+export function count(): Expression<
+  typeof countSchema,
+  never,
+  SqlDialect,
+  number
+>;
 export function count<Input extends ExpressionInput>(
   operand: Input,
   options?: AggregateOptions
 ): Expression<
   typeof countSchema,
   InputReferences<Input>,
-  ExpressionDialect<Input>
+  ExpressionDialect<Input>,
+  number
 >;
 export function count(operand?: ExpressionInput, options?: AggregateOptions) {
   return operand === undefined
