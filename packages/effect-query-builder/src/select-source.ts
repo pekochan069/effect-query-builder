@@ -16,15 +16,18 @@ import type { Column, TableSource } from "./table.ts";
 
 const DerivedTypeId = Symbol("effect-query-builder/DerivedSource");
 
+type StringKey<Key> = `${Extract<Key, number | string>}`;
+
 type ScalarFields<P> = P extends TableSource
-  ? Pick<P["c"], Extract<keyof P["c"], keyof P["select"]["fields"]>>
+  ? Pick<P["c"], Extract<keyof P["c"], StringKey<keyof P["select"]["fields"]>>>
   : P extends DerivedSource
     ? P["c"]
     : {
-        [K in keyof P as P[K] extends Column | Expression ? K : never]: Extract<
-          P[K],
-          Column | Expression
-        >;
+        [
+          K in keyof P as P[K] extends Column | Expression
+            ? StringKey<K>
+            : never
+        ]: Extract<P[K], Column | Expression>;
       };
 
 export type ScalarKey<P> = Extract<keyof ScalarFields<P>, string>;
@@ -35,15 +38,17 @@ type FieldSchema<P, Key extends ScalarKey<P>> = ScalarFields<P>[Key] extends
   ? ScalarFields<P>[Key]["schema"]
   : never;
 
+type FieldValue<Row, Key extends string> = Key extends keyof NonNullable<Row>
+  ? NonNullable<Row>[Key]
+  : Key extends `${infer NumericKey extends number}`
+    ? NonNullable<Row>[NumericKey & keyof NonNullable<Row>]
+    : never;
+
 type ProjectedSchema<P, Key extends ScalarKey<P>, Row> = Schema.Constraint & {
-  readonly Type:
-    | NonNullable<Row>[Key & keyof NonNullable<Row>]
-    | (null extends Row ? null : never);
+  readonly Type: FieldValue<Row, Key> | (null extends Row ? null : never);
   readonly Encoded:
     | FieldSchema<P, Key>["Encoded"]
-    | (null extends Row | NonNullable<Row>[Key & keyof NonNullable<Row>]
-        ? null
-        : never);
+    | (null extends Row | FieldValue<Row, Key> ? null : never);
   readonly DecodingServices: FieldSchema<P, Key>["DecodingServices"];
 };
 

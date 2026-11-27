@@ -212,6 +212,26 @@ test("uses a named scalar subquery and decodes an empty scalar as null", () => {
   ).toEqual([{ first: "Ada", missing: null }]);
 });
 
+test("carries numeric projection keys into derived columns and scalars", () => {
+  using db = new Database(":memory:");
+  const sql = makeClient(db);
+  const codes = Table.fromSchema("codes", Schema.Struct({ 1: Schema.String }));
+
+  db.run('CREATE TABLE codes ("1" TEXT)');
+  db.run("INSERT INTO codes VALUES ('A')");
+
+  const derived = from(codes).as("derived_codes");
+  const projected = from(derived).select({ 2: derived.c[1] });
+  const query = select({ code: projected.scalar("2") });
+
+  expectTypeOf<Effect.Success<typeof query>[number]["code"]>().toEqualTypeOf<
+    string | null
+  >();
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([{ code: "A" }]);
+});
+
 test("combines set operands by canonical projection order and checks their layouts", () => {
   using db = new Database(":memory:");
 
@@ -282,6 +302,61 @@ test("carries restricted dialects through derived sources, joins, CTEs, and sets
   >();
   expect(joined.compile("sqlite").sql).toContain("FULL OUTER JOIN");
   expect(union.compile("pg").sql).toContain("FULL OUTER JOIN");
+});
+
+test("carries a scalar subquery's restricted dialect into projections", () => {
+  const id = from(authors)
+    .fullJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ id: authors.c.id })
+    .scalar("id");
+
+  const embedded = select({ id });
+  const compared = from(authors).select({ matches: eq(id, authors.c.id) });
+
+  expectTypeOf<Parameters<typeof embedded.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
+  expectTypeOf<Parameters<typeof compared.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
+  expect(embedded.compile("pg").sql).toContain("FULL OUTER JOIN");
+  expect(compared.compile("sqlite").sql).toContain("FULL OUTER JOIN");
+});
+
+test("rejects an unsupported scalar in a predicate with a typed SQL error", () => {
+  const client = Effect.runSync(
+    SqlClient.make({
+      acquirer: Effect.die(
+        "The compiler must reject the query before acquisition"
+      ),
+      compiler: Statement.makeCompiler({
+        dialect: "mysql",
+        onCustom: () => ["", []],
+        onIdentifier: Statement.defaultEscape("`"),
+        onRecordUpdate: () => ["", []],
+        placeholder: () => "?",
+      }),
+      driver: "mysql-test",
+      spanAttributes: [],
+    }).pipe(Effect.provide(Reactivity.layer))
+  );
+
+  const id = from(authors)
+    .fullJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ id: authors.c.id })
+    .scalar("id");
+
+  const authorsQuery = from(authors);
+  const filtered = authorsQuery.where(eq(authors.c.id, id));
+
+  expectTypeOf<typeof filtered>().toEqualTypeOf<typeof authorsQuery>();
+
+  const result = Effect.runSync(
+    Effect.flip(Effect.provideService(filtered, SqlClient.SqlClient, client))
+  );
+
+  expect(result).toBeInstanceOf(SqlError.SqlError);
+  expect(result.message).toContain("FULL OUTER JOIN is unsupported");
 });
 
 test("rejects set operands with incompatible encoded projections", () => {

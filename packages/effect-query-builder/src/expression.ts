@@ -3,17 +3,21 @@ import { Statement } from "effect/sql";
 
 import { inferColumnStorage } from "./column-storage.ts";
 import type { Expression as ExpressionNode } from "./kernel/ast.ts";
+import type { SqlDialect } from "./kernel/compile.ts";
 import { isColumn } from "./table.ts";
 import type { Column } from "./table.ts";
 
 const ExpressionTypeId = Symbol("effect-query-builder/Expression");
 const OrderingTypeId = Symbol("effect-query-builder/Ordering");
+declare const ExpressionDialectTypeId: unique symbol;
 
 export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
   Refs extends Column = Column,
+  Dialect extends SqlDialect = SqlDialect,
 > {
   readonly [ExpressionTypeId]: true;
+  readonly [ExpressionDialectTypeId]?: Dialect;
   readonly schema: S;
   readonly node: ExpressionNode<Statement.Fragment>;
   readonly references: readonly Refs[];
@@ -43,6 +47,16 @@ export type ExpressionReferences<Input> =
   Input extends Ordering<infer Item>
     ? InputReferences<Item>
     : InputReferences<Input>;
+
+type ExcludedDialects<Input> =
+  Input extends Expression<Schema.Constraint, Column, infer Dialect>
+    ? Exclude<SqlDialect, Dialect>
+    : never;
+
+export type ExpressionDialect<Input> = Exclude<
+  SqlDialect,
+  ExcludedDialects<Input>
+>;
 
 type Scalar =
   | string
@@ -115,12 +129,13 @@ export const isOrdering = <Input>(value: Input): value is Input & Ordering =>
 export const makeExpression = <
   S extends Schema.Constraint,
   Refs extends Column,
+  Dialect extends SqlDialect = SqlDialect,
 >(
   schema: S,
   node: Node,
   references: readonly Refs[]
 ) =>
-  Object.freeze<Expression<S, Refs>>({
+  Object.freeze<Expression<S, Refs, Dialect>>({
     [ExpressionTypeId]: true,
     node,
     references: Object.freeze(references),
@@ -169,6 +184,20 @@ function referencesOf(operands: readonly unknown[]) {
   });
 }
 
+const composeExpression = <
+  S extends Schema.Constraint,
+  Operands extends readonly (Operand | Statement.Fragment)[],
+>(
+  schema: S,
+  node: Node,
+  operands: Operands
+) =>
+  makeExpression<
+    S,
+    InputReferences<Operands[number]>,
+    ExpressionDialect<Operands[number]>
+  >(schema, node, referencesOf(operands));
+
 const mayBeNull = (operand: Operand | Statement.Fragment) => {
   if (isColumn(operand)) {
     return operand.nullable;
@@ -188,17 +217,18 @@ function nullPropagating<
   operands: Operands
 ): Expression<
   NullableSchema<S, Operands[number]>,
-  InputReferences<Operands[number]>
+  InputReferences<Operands[number]>,
+  ExpressionDialect<Operands[number]>
 >;
 function nullPropagating(
   schema: Schema.Constraint,
   node: Node,
   operands: readonly (Operand | Statement.Fragment)[]
 ) {
-  return makeExpression(
+  return composeExpression(
     operands.some(mayBeNull) ? Schema.NullOr(schema) : schema,
     node,
-    referencesOf(operands)
+    operands
   );
 }
 
@@ -263,10 +293,10 @@ export const not = <Input extends PredicateInput>(operand: Input) =>
 const nullCheck =
   (negate: boolean) =>
   <Input extends ExpressionInput>(operand: Input) =>
-    makeExpression(
+    composeExpression(
       booleanSchema,
       { kind: "nullCheck", negate, operand: toExpressionNode(operand) },
-      referencesOf([operand])
+      [operand]
     );
 
 export const isNull = nullCheck(false);
@@ -326,13 +356,41 @@ type Numeric = number | bigint;
 
 type Orderable = string | Numeric | Date;
 
+type ArithmeticAnchor<L, R> = [L] extends [ScalarExpression]
+  ? unknown
+  : [R] extends [ScalarExpression]
+    ? unknown
+    : never;
+
+const numericBinary = (
+  operator: "+" | "-" | "*" | "/",
+  left: Operand,
+  right: Operand
+) => {
+  if (
+    !isColumn(left) &&
+    !isExpression(left) &&
+    !isColumn(right) &&
+    !isExpression(right)
+  ) {
+    throw new TypeError(
+      "SQL arithmetic requires a numeric column or expression"
+    );
+  }
+
+  return binary(operator, left, right);
+};
+
 const arithmetic =
   (operator: "+" | "-" | "*") =>
   <L extends Operand, R extends Operand>(
     left: L & Matches<L, Numeric>,
-    right: R & Matches<R, Numeric>
+    right: R & Matches<R, Numeric> & ArithmeticAnchor<NoInfer<L>, NoInfer<R>>
   ) =>
-    nullPropagating(numberSchema, binary(operator, left, right), [left, right]);
+    nullPropagating(numberSchema, numericBinary(operator, left, right), [
+      left,
+      right,
+    ]);
 
 export const add = arithmetic("+");
 export const subtract = arithmetic("-");
@@ -340,12 +398,12 @@ export const multiply = arithmetic("*");
 
 export const divide = <L extends Operand, R extends Operand>(
   left: L & Matches<L, Numeric>,
-  right: R & Matches<R, Numeric>
+  right: R & Matches<R, Numeric> & ArithmeticAnchor<NoInfer<L>, NoInfer<R>>
 ) =>
-  makeExpression(
+  composeExpression(
     Schema.NullOr(numberSchema),
-    binary("/", left, right),
-    referencesOf([left, right])
+    numericBinary("/", left, right),
+    [left, right]
   );
 
 interface AggregateOptions {
@@ -356,11 +414,15 @@ export function count(): Expression<typeof countSchema, never>;
 export function count<Input extends ExpressionInput>(
   operand: Input,
   options?: AggregateOptions
-): Expression<typeof countSchema, InputReferences<Input>>;
+): Expression<
+  typeof countSchema,
+  InputReferences<Input>,
+  ExpressionDialect<Input>
+>;
 export function count(operand?: ExpressionInput, options?: AggregateOptions) {
   return operand === undefined
     ? makeExpression(countSchema, { kind: "aggregate", name: "COUNT" }, [])
-    : makeExpression(
+    : composeExpression(
         countSchema,
         {
           distinct: options?.distinct,
@@ -368,7 +430,7 @@ export function count(operand?: ExpressionInput, options?: AggregateOptions) {
           name: "COUNT",
           operand: toExpressionNode(operand),
         },
-        referencesOf([operand])
+        [operand]
       );
 }
 
@@ -378,7 +440,7 @@ const numericAggregate =
     operand: Input & Matches<Input, Numeric>,
     options?: AggregateOptions
   ) =>
-    makeExpression(
+    composeExpression(
       Schema.NullOr(numberSchema),
       {
         distinct: options?.distinct,
@@ -386,7 +448,7 @@ const numericAggregate =
         name,
         operand: toExpressionNode(operand),
       },
-      referencesOf([operand])
+      [operand]
     );
 
 export const sum = numericAggregate("SUM");
@@ -397,10 +459,10 @@ const extremum =
   <Input extends ScalarExpression>(
     operand: Input & Matches<Input, Orderable>
   ) =>
-    makeExpression<Schema.NullOr<Input["schema"]>, InputReferences<Input>>(
+    composeExpression(
       Schema.NullOr<Input["schema"]>(operand.schema),
       { kind: "aggregate", name, operand: toExpressionNode(operand) },
-      referencesOf([operand])
+      [operand]
     );
 
 export const min = extremum("MIN");

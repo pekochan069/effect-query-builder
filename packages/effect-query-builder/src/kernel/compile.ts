@@ -7,6 +7,7 @@ import type {
   SelectStatement,
   Statement,
 } from "./ast.ts";
+import { UnsupportedDialectClauseError } from "./errors.ts";
 import {
   projectionAlias,
   quoteWithDoubledDelimiter,
@@ -470,7 +471,7 @@ class Compiler<Raw> {
 
   #requireClause(clause: ConditionalClause, sql: string) {
     if (this.#profile !== undefined && !supportsClause(this.#profile, clause)) {
-      throw new TypeError(
+      throw new UnsupportedDialectClauseError(
         `${sql} is unsupported by the ${this.#profile} dialect profile`
       );
     }

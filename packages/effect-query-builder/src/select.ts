@@ -20,6 +20,7 @@ import {
 } from "./expression.ts";
 import type {
   Expression as SelectExpression,
+  ExpressionDialect,
   ExpressionInput,
   ExpressionReferences,
   Ordering,
@@ -31,6 +32,7 @@ import type {
   Relation,
   SelectStatement,
 } from "./kernel/ast.ts";
+import { UnsupportedDialectClauseError } from "./kernel/errors.ts";
 import { compileSelect, toSelectFragment } from "./select-compiler.ts";
 import type { SelectDialect } from "./select-compiler.ts";
 import {
@@ -119,6 +121,10 @@ type CheckFrom<P extends Selection, T extends Source> = [P] extends [never]
   ? unknown
   : CheckSelection<P, SourceEntry<T>>;
 
+type SelectionDialect<P extends Selection> = P extends Source
+  ? SourceDialect<P>
+  : ExpressionDialect<P[keyof P]>;
+
 type NewSource<S extends Scope, T extends Source> = T &
   (keyof S extends never ? never : T["name"] extends keyof S ? never : unknown);
 
@@ -186,10 +192,20 @@ export interface SelectQuery<
   readonly [QueryTypeId]: () => QuerySnapshot<P>;
   readonly as: <const Name extends string>(
     name: Name
-  ) => DerivedSelection<Name, P, Result<P, N, Override>, DecodeServices<P>, D>;
+  ) => DerivedSelection<
+    Name,
+    P,
+    Result<P, N, Override>,
+    DecodeServices<P>,
+    D & SelectionDialect<P>
+  >;
   readonly scalar: <const Key extends ScalarKey<P>>(
     key: Key
-  ) => SelectExpression<ScalarSchema<P, Key, Result<P, N, Override>>, never>;
+  ) => SelectExpression<
+    ScalarSchema<P, Key, Result<P, N, Override>>,
+    never,
+    D & SelectionDialect<P>
+  >;
   readonly with: <const Name extends string, Q extends QueryOperand>(
     name: Name & (Name extends keyof C ? never : unknown),
     query: Scoped<Q, C>
@@ -337,8 +353,12 @@ export interface SelectQuery<
       ? []
       : [never]
   ) => SelectQuery<S, P, N, D, T, C>;
-  readonly compile: (dialect: D) => ReturnType<typeof compileSelect>;
-  readonly toFragment: (dialect?: D) => Statement.Fragment;
+  readonly compile: (
+    dialect: D & SelectionDialect<P>
+  ) => ReturnType<typeof compileSelect>;
+  readonly toFragment: (
+    dialect?: D & SelectionDialect<P>
+  ) => Statement.Fragment;
   readonly findOne: () => Effect.Effect<
     Result<P, N, Override>,
     SelectError | Cause.NoSuchElementError,
@@ -503,6 +523,17 @@ const supportsMysql = (source: Source) =>
 const supportedDialects: (mysql: boolean) => readonly SelectDialect[] = (
   mysql
 ) => (mysql ? ["pg", "sqlite", "mysql"] : ["pg", "sqlite"]);
+
+const unsupportedSelect = (message: string, cause: unknown = message) =>
+  Effect.fail(
+    new SqlError.SqlError({
+      reason: new SqlError.UnknownError({
+        cause,
+        message,
+        operation: "SELECT",
+      }),
+    })
+  );
 
 const copySelection = (selection: Selection) => {
   if (isSource(selection)) {
@@ -907,24 +938,23 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
             ? "SELECT is unsupported by this SQL driver"
             : "FULL OUTER JOIN is unsupported by MySQL";
 
-        return Effect.fail(
-          new SqlError.SqlError({
-            reason: new SqlError.UnknownError({
-              cause: message,
-              message,
-              operation: "SELECT",
-            }),
-          })
-        );
+        return unsupportedSelect(message);
       }
 
-      const sql = client.withoutTransforms();
+      try {
+        const sql = client.withoutTransforms();
+        const compiled = sql`${this.toFragment(dialect)}`;
 
-      const compiled = sql`${this.toFragment(dialect)}`;
+        this.#statements.set(client, compiled);
 
-      this.#statements.set(client, compiled);
+        return Effect.succeed(compiled);
+      } catch (error) {
+        if (error instanceof UnsupportedDialectClauseError) {
+          return unsupportedSelect(error.message, error);
+        }
 
-      return Effect.succeed(compiled);
+        throw error;
+      }
     });
   }
 

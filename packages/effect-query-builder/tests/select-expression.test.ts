@@ -198,6 +198,7 @@ test("executes arithmetic and aggregate expressions with SQL null behavior", () 
       ["divide", divide(amount, 2)],
       ["divisionByZero", divide(amount, 0)],
       ["multiply", multiply(amount, 2)],
+      ["reversed", subtract(15, amount)],
       ["subtract", subtract(amount, 1)],
     ])
   ).toEqual({
@@ -205,6 +206,7 @@ test("executes arithmetic and aggregate expressions with SQL null behavior", () 
     divide: 4,
     divisionByZero: null,
     multiply: 16,
+    reversed: 7,
     subtract: 7,
   });
 
@@ -242,6 +244,13 @@ test("executes arithmetic and aggregate expressions with SQL null behavior", () 
   expect(decodeCount("3")).toBe(3);
   expect(decodeCount(3n)).toBe(3);
   expect(() => decodeCount("9007199254740992")).toThrow();
+});
+
+test("requires a typed SQL operand for arithmetic", () => {
+  expect(() =>
+    // @ts-expect-error Two bound parameters do not supply SQL numeric types.
+    add(2, 3)
+  ).toThrow("SQL arithmetic requires a numeric column or expression");
 });
 
 test("preserves referenced column identities and rejects incompatible operands", () => {
