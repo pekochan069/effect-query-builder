@@ -1,13 +1,15 @@
 import { Database } from "bun:sqlite";
 import { expect, expectTypeOf, test } from "bun:test";
 
-import { Cause, Effect, Option, Schema, Stream } from "effect";
+import { Cause, Effect, Option, Result, Schema, Stream } from "effect";
 import { map } from "effect/Effect";
 import { Reactivity } from "effect/reactivity";
+import { Model } from "effect/schema";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
 
 import {
+  add,
   alias,
   count,
   desc,
@@ -40,7 +42,10 @@ const decodeFixtureBinds = Schema.decodeUnknownSync(
   )
 );
 
-const makeClient = (database: Database) => {
+const makeClient = (
+  database: Database,
+  onRows?: (rows: readonly SqlConnection.Row[]) => void
+) => {
   const execute = (
     text: string,
     params: readonly unknown[],
@@ -55,6 +60,8 @@ const makeClient = (database: Database) => {
         const rows = database
           .query<SqlConnection.Row, typeof binds>(text)
           .all(...binds);
+
+        onRows?.(rows);
 
         return transform === undefined ? rows : transform(rows);
       },
@@ -90,7 +97,10 @@ const makeClient = (database: Database) => {
   );
 };
 
-const fixture = (database: Database) => {
+const fixture = (
+  database: Database,
+  onRows?: (rows: readonly SqlConnection.Row[]) => void
+) => {
   database.run(
     "CREATE TABLE people (display_name TEXT NOT NULL, id INTEGER PRIMARY KEY)"
   );
@@ -98,7 +108,7 @@ const fixture = (database: Database) => {
   database.run("INSERT INTO people VALUES ('Ada', 1), ('Lin', 2)");
   database.run("INSERT INTO posts VALUES (NULL, NULL), (42, 'note')");
 
-  return makeClient(database);
+  return makeClient(database, onRows);
 };
 
 test("compiles table shorthand with physical names and independent aliases", () => {
@@ -292,6 +302,18 @@ test("requires an explicit dialect for a dotted physical identifier in a templat
   ).toEqual([{ __eqb_0: 1 }]);
 });
 
+test("keeps physical identifiers when a template client transforms names", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  const query = from(people).where(eq(people.c.id, 2));
+
+  expect(
+    Effect.runSync(
+      Effect.result(sql`SELECT * FROM (${query.toFragment("sqlite")})`)
+    )
+  ).toEqual(Result.succeed([{ driver___eqb_0: "Lin", driver___eqb_1: 2 }]));
+});
+
 test("supports cardinality, streaming, and native schema errors", () => {
   using database = new Database(":memory:");
   const sql = fixture(database);
@@ -320,6 +342,58 @@ test("supports cardinality, streaming, and native schema errors", () => {
   expect(results.rowError._tag).toEqual("SchemaError");
   expect(results.rowsError).toBeInstanceOf(Cause.NoSuchElementError);
   expect(results.stream).toEqual([{ id: 1 }, { id: 2 }]);
+});
+
+test("caps first-row reads at the database and preserves the original query", () => {
+  using database = new Database(":memory:");
+  const rowCounts: number[] = [];
+
+  const sql = fixture(database, (rows) => {
+    rowCounts.push(rows.length);
+  });
+
+  database.run("INSERT INTO people VALUES ('Mae', 3)");
+
+  const base = from(people).select({ id: people.c.id });
+  const ordered = base.orderBy(desc(people.c.id));
+  const window = ordered.offset(1).limit(2);
+
+  const compound = base
+    .where(eq(people.c.id, 1))
+    .unionAll(base.where(eq(people.c.id, 1)));
+
+  const results = Effect.runSync(
+    Effect.gen(function* results() {
+      return {
+        ordered: yield* ordered,
+        first: yield* ordered.findOne(),
+        windowFirst: yield* window.findOneOption(),
+        window: yield* window,
+        empty: yield* ordered.limit(0).findOneOption(),
+        compoundFirst: yield* compound.findOne(),
+        compound: yield* compound,
+      };
+    }).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  );
+
+  expect(results).toEqual({
+    ordered: [{ id: 3 }, { id: 2 }, { id: 1 }],
+    first: { id: 3 },
+    windowFirst: Option.some({ id: 2 }),
+    window: [{ id: 2 }, { id: 1 }],
+    empty: Option.none(),
+    compoundFirst: { id: 1 },
+    compound: [{ id: 1 }, { id: 1 }],
+  });
+  expect(rowCounts).toEqual([3, 1, 1, 2, 0, 1, 2]);
+  expect(() =>
+    Effect.runSync(
+      ordered
+        .limit(2.5)
+        .findOne()
+        .pipe(Effect.provideService(SqlClient.SqlClient, sql))
+    )
+  ).toThrow("LIMIT must be a non-negative safe integer");
 });
 
 test("tracks alias scope and nullability across right and full joins", () => {
@@ -359,6 +433,121 @@ test("tracks alias scope and nullability across right and full joins", () => {
   expect(from(people).crossJoin(posts).compile("pg").sql).toContain(
     "CROSS JOIN"
   );
+});
+
+test("narrows matched RIGHT JOIN rows and preserves absent rows and expressions", () => {
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  database.run("INSERT INTO posts VALUES (1, 'match')");
+  const run = Effect.provideService(SqlClient.SqlClient, sql);
+
+  const right = from(people)
+    .rightJoin(posts, eq(people.c.id, posts.c.id))
+    .orderBy(posts.c.id)
+    .$narrow<{ readonly id: 1 }>();
+
+  expectTypeOf<Effect.Success<typeof right>>().toEqualTypeOf<
+    readonly ({ readonly displayName: string; readonly id: 1 } | null)[]
+  >();
+  expect(Effect.runSync(right.pipe(run))).toEqual([
+    null,
+    { displayName: "Ada", id: 1 },
+    null,
+  ]);
+
+  const full = from(people)
+    .fullJoin(posts, eq(people.c.id, posts.c.id))
+    .select({
+      person: people,
+      note: posts.c.note,
+      nextId: add(people.c.id, 1),
+    })
+    .orderBy(people.c.id, posts.c.id);
+
+  expectTypeOf<Effect.Success<typeof full>[number]["nextId"]>().toEqualTypeOf<
+    number | null
+  >();
+  expect(Effect.runSync(full.pipe(run, Effect.result))).toEqual(
+    Result.succeed([
+      { person: null, note: Option.none(), nextId: null },
+      { person: null, note: Option.some("note"), nextId: null },
+      {
+        person: { displayName: "Ada", id: 1 },
+        note: Option.some("match"),
+        nextId: 2,
+      },
+      { person: { displayName: "Lin", id: 2 }, note: null, nextId: 3 },
+    ])
+  );
+});
+
+test("selects and decodes Table.fromModel rows", () => {
+  class Person extends Model.Class<Person>("Person")({
+    id: Schema.Int,
+    displayName: Schema.String,
+    note: Model.FieldOption(Schema.String),
+  }) {}
+
+  using database = new Database(":memory:");
+  const sql = fixture(database);
+  database.run("ALTER TABLE people ADD COLUMN note TEXT");
+
+  const modelPeople = Table.fromModel("people", Person, {
+    naming: "snake_case",
+  });
+
+  const person = Effect.runSync(
+    from(modelPeople)
+      .where(eq(modelPeople.c.id, 1))
+      .findOne()
+      .pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  );
+
+  expect(person).toBeInstanceOf(Person);
+  expect(person).toMatchObject({
+    id: 1,
+    displayName: "Ada",
+    note: Option.none(),
+  });
+});
+
+test("rejects references outside the runtime query scope", () => {
+  const query = from(people);
+
+  expect(() =>
+    // @ts-expect-error The runtime guard protects untyped consumers.
+    query.where(eq(posts.c.id, 1))
+  ).toThrow("Column posts.id is outside the SELECT scope");
+});
+
+test("reports an unsupported SQL driver before acquiring a connection", () => {
+  const sql = Effect.runSync(
+    SqlClient.make({
+      acquirer: Effect.die("Unexpected connection acquisition"),
+      compiler: Statement.makeCompiler({
+        dialect: "mssql",
+        onCustom: () => ["", []],
+        onIdentifier: Statement.defaultEscape('"'),
+        onRecordUpdate: () => ["", []],
+        placeholder: () => "?",
+      }),
+      driver: "mssql-test",
+      spanAttributes: [],
+    }).pipe(Effect.provide(Reactivity.layer))
+  );
+
+  const result = Effect.runSync(
+    from(people)
+      .findOneOption()
+      .pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.result)
+  );
+
+  expect(result).toMatchObject({
+    failure: {
+      _tag: "SqlError",
+      reason: { message: "SELECT is unsupported by this SQL driver" },
+    },
+  });
 });
 
 test("groups, applies HAVING, and asserts the selected type", () => {

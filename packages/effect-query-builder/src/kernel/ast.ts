@@ -143,10 +143,7 @@ export interface SelectStatement<Raw = never> {
   readonly groupBy?: NonEmpty<Expression<Raw>>;
   readonly having?: Expression<Raw>;
   readonly orderBy?: NonEmpty<OrderBy<Raw>>;
-  readonly limit?: {
-    readonly count: number;
-    readonly offset?: number;
-  };
+  readonly limit?: number;
   readonly offset?: number;
   readonly sets?: readonly {
     readonly operator: "UNION" | "UNION ALL" | "INTERSECT" | "EXCEPT";

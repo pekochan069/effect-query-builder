@@ -81,6 +81,26 @@ test("compiles empty IN and NOT IN as portable boolean predicates", () => {
   }
 });
 
+test("compiles an offset without an explicit limit for each dialect", () => {
+  const query: SelectStatement = {
+    kind: "select",
+    projections: [{ expression: { kind: "numberLiteral", value: 1 } }],
+    offset: 2,
+  };
+
+  expect(compileSelect(query, "pg").sql).toBe('SELECT 1 AS "__eqb_0" OFFSET 2');
+  expect(compileSelect(query, "mysql").sql).toBe(
+    "SELECT 1 AS `__eqb_0` LIMIT 18446744073709551615 OFFSET 2"
+  );
+  expect(compileSelect(query, "sqlite").sql).toBe(
+    'SELECT 1 AS "__eqb_0" LIMIT -1 OFFSET 2'
+  );
+  expect(sql`${toSelectFragment(query)}`.compile()).toEqual([
+    'SELECT 1 AS "__eqb_0" LIMIT 9223372036854775807 OFFSET 2',
+    [],
+  ]);
+});
+
 test("executes chained sets with operand limits and stable output names", () => {
   const query: SelectStatement = {
     kind: "select",

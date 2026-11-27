@@ -8,6 +8,7 @@ import {
 } from "effect";
 import type { Option, Types, Schema } from "effect";
 import { flatMap, forEach, map } from "effect/Effect";
+import { identity } from "effect/Function";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
 
@@ -32,9 +33,9 @@ import type {
   Relation,
   SelectStatement,
 } from "./kernel/ast.ts";
+import type { SqlDialect } from "./kernel/compile.ts";
 import { UnsupportedDialectClauseError } from "./kernel/errors.ts";
 import { compileSelect, toSelectFragment } from "./select-compiler.ts";
-import type { SelectDialect } from "./select-compiler.ts";
 import { alignSetProjection, planProjection } from "./select-projection.ts";
 import type {
   DecodeServices,
@@ -71,6 +72,11 @@ type Scoped<T, S extends Scope = Scope> = T | ((tables: S) => T);
 type SqlExpression = Expression<Statement.Fragment>;
 
 type SelectAst = SelectStatement<Statement.Fragment>;
+
+type StatementCache = WeakMap<
+  SqlClient.SqlClient,
+  Statement.Statement<SqlConnection.Row>
+>;
 
 type SelectJoin = Join<Statement.Fragment>;
 
@@ -143,7 +149,6 @@ interface QuerySnapshot<P extends Selection = Selection> {
   readonly plan: ProjectionPlan;
   readonly ast: SelectAst;
   readonly selection: P;
-  readonly mysql: boolean;
 }
 
 interface QueryOperand extends Effect.Effect<
@@ -177,7 +182,7 @@ type SelectBuilder<
   S extends Scope,
   P extends Selection,
   N extends string,
-  D extends SelectDialect,
+  D extends SqlDialect,
   Override,
   C extends Scope,
   Compound extends boolean,
@@ -189,7 +194,7 @@ interface SelectResult<
   S extends Scope,
   P extends Selection,
   N extends string,
-  D extends SelectDialect,
+  D extends SqlDialect,
   Override,
   C extends Scope,
   Compound extends boolean,
@@ -308,7 +313,7 @@ export interface SelectQuery<
   S extends Scope,
   P extends Selection,
   N extends string = never,
-  D extends SelectDialect = SelectDialect,
+  D extends SqlDialect = SqlDialect,
   Override = never,
   C extends Scope = EmptyScope,
 > extends SelectResult<S, P, N, D, Override, C, false> {
@@ -433,7 +438,6 @@ interface SelectState {
   }[];
   readonly selection?: Selection;
   readonly nullable: ReadonlySet<string>;
-  readonly mysql: boolean;
   readonly distinct?: boolean;
   readonly where?: SqlExpression;
   readonly groupBy: readonly SqlExpression[];
@@ -447,7 +451,6 @@ const empty: SelectState = {
   ctes: emptyScope,
   groupBy: [],
   joins: [],
-  mysql: true,
   nullable: new Set(),
   orderBy: [],
   scope: emptyScope,
@@ -551,9 +554,6 @@ const relation: (
   };
 };
 
-const supportsMysql = (source: Source) =>
-  !isDerivedSource(source) || derivedDefinition(source).mysql;
-
 const unsupportedSelect = (message: string, cause: unknown = message) =>
   Effect.fail(
     new SqlError.SqlError({
@@ -589,10 +589,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   readonly #state: SelectState;
-  readonly #statements = new WeakMap<
-    SqlClient.SqlClient,
-    Statement.Statement<SqlConnection.Row>
-  >();
+  readonly #statements: StatementCache = new WeakMap();
+  #firstStatements?: StatementCache;
   #planCache?: ProjectionPlan;
   #fragment?: Statement.Fragment;
 
@@ -623,7 +621,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     const source = resolve(input, this.#state.ctes);
 
     return this.#copy({
-      mysql: this.#state.mysql && supportsMysql(source),
       scope: addSource(this.#state.scope, source),
       source,
     });
@@ -632,7 +629,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   [QueryTypeId]() {
     return {
       ast: this.#ast(),
-      mysql: this.#state.mysql,
       plan: this.#plan(),
       selection: this.#selection(),
     };
@@ -640,7 +636,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
   as(name: string) {
     return makeDerivedSource(name, {
-      mysql: this.#state.mysql,
       plan: this.#plan(),
       relation: { kind: "subquery", query: this.#ast() },
     });
@@ -671,18 +666,16 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   with(name: string, operand: Scoped<QueryOperand>) {
-    const { ctes, mysql, with: previous } = this.#state;
+    const { ctes, with: previous } = this.#state;
     const query = resolve(operand, ctes)[QueryTypeId]();
 
     const source = makeDerivedSource(name, {
-      mysql: query.mysql,
       plan: query.plan,
       relation: { kind: "cte", name },
     });
 
     return this.#copy({
       ctes: addSource(ctes, source),
-      mysql: mysql && query.mysql,
       with: [...previous, { name, query: query.ast }],
     });
   }
@@ -691,7 +684,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     const operand = query[QueryTypeId]();
 
     return this.#copy({
-      mysql: this.#state.mysql && operand.mysql,
       sets: [...this.#state.sets, { operand, operator }],
     });
   }
@@ -731,7 +723,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       throw new TypeError("SELECT joins require a FROM source");
     }
 
-    const { ctes, joins, mysql, nullable } = this.#state;
+    const { ctes, joins, nullable } = this.#state;
     const source = resolve(inputSource, ctes);
     const scope = addSource(this.#state.scope, source);
     const input = resolve(predicate, scope);
@@ -746,7 +738,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
     return this.#copy({
       joins: [...joins, { kind, on, source }],
-      mysql: mysql && kind !== "full" && supportsMysql(source),
       nullable: new Set([...nullable, ...leftNulls, ...rightNulls]),
       scope,
     });
@@ -779,7 +770,6 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
     return this.#copy({
       joins: [...this.#state.joins, { kind: "cross", source }],
-      mysql: this.#state.mysql && supportsMysql(source),
       scope: addSource(this.#state.scope, source),
     });
   }
@@ -943,7 +933,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       groupBy: Arr.isReadonlyArrayNonEmpty(groupBy) ? groupBy : undefined,
       having,
       kind: "select",
-      limit: limit === undefined ? undefined : { count: limit },
+      limit,
       offset,
       orderBy: Arr.isReadonlyArrayNonEmpty(orderBy) ? orderBy : undefined,
       projections: plan.columns,
@@ -956,7 +946,34 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     } satisfies SelectAst;
   }
 
-  toFragment(dialect?: SelectDialect) {
+  #firstAst() {
+    const query = this.#ast();
+
+    if (query.sets.length === 0) {
+      const { limit } = query;
+
+      return limit === undefined || (Number.isSafeInteger(limit) && limit > 1)
+        ? { ...query, limit: 1 }
+        : query;
+    }
+
+    const table = "__eqb_first";
+    const [first, ...rest] = query.projections;
+
+    const project = ({ alias }: typeof first) => ({
+      alias,
+      expression: { kind: "column" as const, name: alias, table },
+    });
+
+    return {
+      from: { relation: { alias: table, kind: "subquery", query } },
+      kind: "select",
+      limit: 1,
+      projections: [project(first), ...rest.map(project)],
+    } satisfies SelectAst;
+  }
+
+  toFragment(dialect?: SqlDialect) {
     if (dialect !== undefined) {
       return toSelectFragment(this.#ast(), dialect);
     }
@@ -970,13 +987,17 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     return this.toFragment().segments;
   }
 
-  compile(dialect: SelectDialect) {
+  compile(dialect: SqlDialect) {
     return compileSelect(this.#ast(), dialect);
   }
 
-  #statement() {
+  #statement(firstRowOnly = false) {
     return flatMap(SqlClient.SqlClient, (client) => {
-      const statement = this.#statements.get(client);
+      const statements = firstRowOnly
+        ? (this.#firstStatements ??= new WeakMap())
+        : this.#statements;
+
+      const statement = statements.get(client);
 
       if (statement !== undefined) {
         return Effect.succeed(statement);
@@ -989,20 +1010,20 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
         sqlite: () => "sqlite" as const,
       });
 
-      if (dialect === null || (dialect === "mysql" && !this.#state.mysql)) {
-        const message =
-          dialect === null
-            ? "SELECT is unsupported by this SQL driver"
-            : "FULL OUTER JOIN is unsupported by MySQL";
-
-        return unsupportedSelect(message);
+      if (dialect === null) {
+        return unsupportedSelect("SELECT is unsupported by this SQL driver");
       }
 
       try {
         const sql = client.withoutTransforms();
-        const compiled = sql`${this.toFragment(dialect)}`;
 
-        this.#statements.set(client, compiled);
+        const fragment = firstRowOnly
+          ? toSelectFragment(this.#firstAst(), dialect)
+          : this.toFragment(dialect);
+
+        const compiled = sql`${fragment}`;
+
+        statements.set(client, compiled);
 
         return Effect.succeed(compiled);
       } catch (error) {
@@ -1024,7 +1045,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   findOneOption() {
-    return flatMap(this.#statement(), (statement) =>
+    return flatMap(this.#statement(true), (statement) =>
       flatMap(statement.withoutTransform, (rows) =>
         Arr.isReadonlyArrayNonEmpty(rows)
           ? Effect.asSome(this.#plan().decode(rows[0]))
@@ -1058,9 +1079,7 @@ export function from<const T extends Source>(
   source: T
 ): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
 export function from(source: Source) {
-  const result: object = new Query(empty).from(source);
-
-  return result;
+  return identity<object>(new Query(empty).from(source));
 }
 
 export function select<const T extends Source>(
@@ -1072,11 +1091,9 @@ export function select<const P extends Exclude<Selection, Source>>(
 export function select(selection: Selection) {
   const query = new Query(empty);
 
-  const result: object = isSource(selection)
-    ? query.from(selection)
-    : query.select(selection);
-
-  return result;
+  return identity<object>(
+    isSource(selection) ? query.from(selection) : query.select(selection)
+  );
 }
 
 export function withCte<const Name extends string, Q extends QueryOperand>(
@@ -1091,7 +1108,5 @@ export function withCte<const Name extends string, Q extends QueryOperand>(
   SourceEntry<OperandSource<Name, Q>>
 >;
 export function withCte(name: string, query: QueryOperand) {
-  const result: object = new Query(empty).with(name, query);
-
-  return result;
+  return identity<object>(new Query(empty).with(name, query));
 }

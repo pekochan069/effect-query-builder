@@ -44,7 +44,7 @@ export { select } from "./select.ts";
 
 export type { SelectQuery } from "./select.ts";
 
-export type { SelectDialect } from "./select-compiler.ts";
+export type { SqlDialect as SelectDialect } from "./kernel/compile.ts";
 
 export { alias } from "./select-source.ts";
 

@@ -9,7 +9,7 @@ import type {
   SqlValue,
 } from "./expression.ts";
 import type { SelectStatement } from "./kernel/ast.ts";
-import type { SelectDialect } from "./select-compiler.ts";
+import type { SqlDialect } from "./kernel/compile.ts";
 import type { ProjectionPlan, Selection } from "./select-projection.ts";
 import {
   alias as aliasTable,
@@ -73,7 +73,6 @@ export type ScalarSchema<P, Key extends ScalarKey<P>, Row> = ReturnType<
 >;
 
 interface DerivedDefinition {
-  readonly mysql: boolean;
   readonly plan: ProjectionPlan;
   readonly relation:
     | { readonly kind: "cte"; readonly name: string }
@@ -90,7 +89,7 @@ export interface DerivedSource<
   >,
   Row = unknown,
   R = unknown,
-  Dialect extends SelectDialect = SelectDialect,
+  Dialect extends SqlDialect = SqlDialect,
 > {
   readonly [DerivedTypeId]: DerivedDefinition & { readonly dialect?: Dialect };
   readonly name: Name;
@@ -104,14 +103,14 @@ export type Source = TableSource | DerivedSource;
 
 export type SourceDialect<T extends Source> = T extends DerivedSource
   ? NonNullable<T[typeof DerivedTypeId]["dialect"]>
-  : SelectDialect;
+  : SqlDialect;
 
 export type DerivedSelection<
   Name extends string,
   P extends Selection,
   Row,
   R,
-  D extends SelectDialect,
+  D extends SqlDialect,
 > = DerivedSource<
   Name,
   {

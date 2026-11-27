@@ -595,10 +595,10 @@ class Compiler<Raw> {
       });
     }
 
-    const offset = query.offset ?? query.limit?.offset;
+    const { limit, offset } = query;
 
-    if (query.limit !== undefined) {
-      this.#limitValue("LIMIT", query.limit.count);
+    if (limit !== undefined) {
+      this.#limitValue("LIMIT", limit);
     } else if (offset !== undefined) {
       this.#text(offsetOnlyLimit[this.#dialect ?? "portable"]);
     }

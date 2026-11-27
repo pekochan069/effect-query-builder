@@ -4,11 +4,9 @@ import type { SelectStatement } from "./kernel/ast.ts";
 import { renderSelect } from "./kernel/compile.ts";
 import type { SqlDialect } from "./kernel/compile.ts";
 
-export type SelectDialect = SqlDialect;
-
 export const toSelectFragment = (
   query: SelectStatement<Statement.Fragment>,
-  dialect?: SelectDialect
+  dialect?: SqlDialect
 ) => {
   const segments: Statement.Segment[] = [];
 
@@ -47,7 +45,7 @@ export const toSelectFragment = (
   return Statement.fragment(Object.freeze(segments));
 };
 
-const makeCompiler = (dialect: SelectDialect) =>
+const makeCompiler = (dialect: SqlDialect) =>
   Statement.makeCompiler<Statement.Custom>({
     dialect,
     onCustom(segment) {
@@ -68,11 +66,11 @@ const compilers = {
   mysql: makeCompiler("mysql"),
   pg: makeCompiler("pg"),
   sqlite: makeCompiler("sqlite"),
-} satisfies Record<SelectDialect, Statement.Compiler>;
+} satisfies Record<SqlDialect, Statement.Compiler>;
 
 export const compileSelect = (
   query: SelectStatement<Statement.Fragment>,
-  dialect: SelectDialect
+  dialect: SqlDialect
 ) => {
   const [sql, params] = compilers[dialect].compile(
     toSelectFragment(query, dialect),

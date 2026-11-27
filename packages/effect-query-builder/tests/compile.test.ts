@@ -33,7 +33,8 @@ test("compiles the same select for all three SQL dialects", () => {
 test("emits clauses and nested binds in SQL order", () => {
   const query: SelectStatement = {
     kind: "select",
-    limit: { count: 10, offset: 2 },
+    limit: 10,
+    offset: 2,
     orderBy: [
       { direction: "desc", expression: { kind: "column", name: "tag" } },
     ],
