@@ -19,6 +19,7 @@ import {
   Table,
   update,
 } from "../src/index.ts";
+import type { Expression } from "../src/index.ts";
 import * as mysql from "../src/mysql.ts";
 import * as pg from "../src/pg.ts";
 import * as sqlite from "../src/sqlite.ts";
@@ -241,11 +242,26 @@ test("copies the named scalar SELECT outputs while preserving the source binds",
 
   expect(Effect.runSync(query.compile("pg"))).toEqual({
     params: [2, 3],
-    sql: 'INSERT INTO "destination" ("object_id", "payload_text") SELECT "__eqb_insert_source"."__eqb_0" AS "__eqb_0", "__eqb_insert_source"."__eqb_1" AS "__eqb_1" FROM (SELECT ("source"."item" + $1) AS "__eqb_0", "source"."payload" AS "__eqb_1" FROM "source" WHERE ("source"."item" = $2)) AS "__eqb_insert_source" RETURNING "destination"."object_id" AS "__eqb_0", "destination"."payload_text" AS "__eqb_1"',
+    sql: 'INSERT INTO "destination" ("object_id", "payload_text") SELECT ("source"."item" + $1) AS "__eqb_0", "source"."payload" AS "__eqb_1" FROM "source" WHERE ("source"."item" = $2) RETURNING "destination"."object_id" AS "__eqb_0", "destination"."payload_text" AS "__eqb_1"',
   });
   expect(
     Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
   ).toEqual([{ objectId: 5, payloadText: "copy" }]);
+});
+
+test("lets PostgreSQL infer an INSERT SELECT parameter from its destination column", () => {
+  const numbers = Table.fromSchema(
+    "numbers",
+    Schema.Struct({ value: Schema.Int })
+  );
+
+  const value = raw(Schema.Int, Statement.fragment([Statement.parameter(42)]));
+  const query = pg.insertInto(numbers).fromSelect(select({ value }));
+
+  expect(Effect.runSync(query.compile("pg"))).toEqual({
+    params: [42],
+    sql: 'INSERT INTO "numbers" ("value") SELECT ($1) AS "__eqb_0"',
+  });
 });
 
 test("deletes through an alias and decodes only the matching SQLite row", () => {
@@ -431,6 +447,40 @@ test("checks decoded insert rows and rejects a SQL expression that would bypass 
   expect(received).toEqual([]);
 });
 
+test("rejects INSERT SELECT that would bypass a whole-row check before sending SQL", () => {
+  using database = new Database(":memory:");
+  const received: string[] = [];
+
+  const sql = makeClient(database, (text) => {
+    received.push(text);
+  });
+
+  const fields = Schema.Struct({ first: Schema.Int, last: Schema.Int });
+  const source = Table.fromSchema("source", fields);
+
+  const destination = Table.fromSchema(
+    "destination",
+    fields.check(Schema.makeFilter(({ first, last }) => first <= last))
+  );
+
+  database.run("CREATE TABLE source (first INTEGER, last INTEGER)");
+  database.run("CREATE TABLE destination (first INTEGER, last INTEGER)");
+  database.run("INSERT INTO source VALUES (10, 7)");
+
+  const query = insertInto(destination).fromSelect(from(source));
+
+  const result = Effect.runSync(
+    Effect.result(Effect.provideService(query, SqlClient.SqlClient, sql))
+  );
+
+  expect(result).toMatchObject({
+    _tag: "Failure",
+    failure: { _tag: "WriteInputError" },
+  });
+  expect(received).toEqual([]);
+  expect(database.query("SELECT * FROM destination").all()).toEqual([]);
+});
+
 test("preserves separate database defaults in bulk on PostgreSQL and reports the SQLite limitation", () => {
   const settings = Table.fromSchema(
     "settings",
@@ -452,10 +502,79 @@ test("preserves separate database defaults in bulk on PostgreSQL and reports the
   ).toContain("DEFAULT in VALUES is unsupported");
 });
 
+test("omits undefined optional encodings and rejects undefined required encodings", () => {
+  using database = new Database(":memory:");
+  const client = makeClient(database);
+
+  const settings = Table.fromSchema(
+    "settings",
+    Schema.Struct({ id: Schema.Int, label: Schema.optional(Schema.String) })
+  );
+
+  database.run("CREATE TABLE settings (id INTEGER, label TEXT DEFAULT 'base')");
+
+  const query = insertInto(settings).values({ id: 1, label: undefined });
+
+  expect(
+    Effect.runSync(
+      Effect.result(Effect.provideService(query, SqlClient.SqlClient, client))
+    )
+  ).toEqual(Result.succeed(undefined));
+  expect(database.query("SELECT * FROM settings").all()).toEqual([
+    { id: 1, label: "base" },
+  ]);
+
+  const unsafe = Table.fromSchema(
+    "unsafe",
+    Schema.Struct({ value: Schema.Undefined })
+  );
+
+  expect(
+    Effect.runSync(
+      Effect.result(
+        insertInto(unsafe).values({ value: undefined }).compile("pg")
+      )
+    )
+  ).toMatchObject({
+    _tag: "Failure",
+    failure: {
+      _tag: "WriteInputError",
+      message: "Column value cannot bind undefined",
+    },
+  });
+});
+
 const totals = Table.withNaming("snake_case").fromSchema(
   "totals",
   Schema.Struct({ itemId: Schema.Int, hitCount: Schema.Int })
 );
+
+test("snapshots rows, patches, and conflict keys when composing a write", () => {
+  const row = { itemId: 1, hitCount: 2 };
+  const batch = [row];
+  const patch = { hitCount: 3 };
+  const target: ["itemId" | "hitCount"] = ["itemId"];
+
+  const insertQuery = insertInto(totals).values(row);
+  const batchQuery = insertInto(totals).values(batch);
+  const updateQuery = update(totals).set(patch);
+  const upsert = insertQuery.onConflictDoUpdate(target, patch);
+  const duplicate = insertQuery.onDuplicateKeyUpdate(patch);
+
+  row.hitCount = 20;
+  batch.push({ itemId: 2, hitCount: 30 });
+  patch.hitCount = 40;
+  target[0] = "hitCount";
+
+  expect(Effect.runSync(insertQuery.compile("pg")).params).toEqual([1, 2]);
+  expect(Effect.runSync(batchQuery.compile("pg")).params).toEqual([1, 2]);
+  expect(Effect.runSync(updateQuery.compile("pg")).params).toEqual([3]);
+  expect(Effect.runSync(upsert.compile("pg"))).toEqual({
+    params: [1, 2, 3],
+    sql: 'INSERT INTO "totals" ("item_id", "hit_count") VALUES ($1, $2) ON CONFLICT ("item_id") DO UPDATE SET "hit_count" = $3',
+  });
+  expect(Effect.runSync(duplicate.compile("mysql")).params).toEqual([1, 2, 3]);
+});
 
 test("ignores existing rows by logical conflict target and returns only inserted rows", () => {
   using database = new Database(":memory:");
@@ -517,7 +636,7 @@ test("updates conflicts from INSERT SELECT with existing and incoming values", (
 
   expect(Effect.runSync(query.compile("pg"))).toEqual({
     params: [3, 5],
-    sql: 'INSERT INTO "totals" ("hit_count", "item_id") SELECT "__eqb_insert_source"."__eqb_0" AS "__eqb_0", "__eqb_insert_source"."__eqb_1" AS "__eqb_1" FROM (SELECT ("stage"."hit_count" + $1) AS "__eqb_0", "stage"."item_id" AS "__eqb_1" FROM "stage") AS "__eqb_insert_source" ON CONFLICT ("item_id") DO UPDATE SET "hit_count" = (("totals"."hit_count" + "excluded"."hit_count") + $2) RETURNING "totals"."hit_count" AS "__eqb_0"',
+    sql: 'INSERT INTO "totals" ("hit_count", "item_id") SELECT ("stage"."hit_count" + $1) AS "__eqb_0", "stage"."item_id" AS "__eqb_1" FROM "stage" ON CONFLICT ("item_id") DO UPDATE SET "hit_count" = (("totals"."hit_count" + "excluded"."hit_count") + $2) RETURNING "totals"."hit_count" AS "__eqb_0"',
   });
   expect(
     Effect.runSync(
@@ -665,11 +784,102 @@ test("rejects an incoming column inside a MySQL scalar subquery", () => {
     .insertInto(maybeTotals)
     .values({ itemId: 1, hitCount: 7 })
     .onDuplicateKeyUpdate(({ incoming }) => ({
-      hitCount: select({ hits: incoming("hitCount") }).scalar("hits"),
+      hitCount: from(maybeTotals)
+        .select({ hits: incoming("hitCount") })
+        .scalar("hits"),
     }));
 
   expect(Effect.runSync(Effect.result(query.compile("mysql")))).toMatchObject({
     _tag: "Failure",
     failure: { message: "Incoming columns require an upsert assignment" },
+  });
+});
+
+test("rejects an incoming column captured from an upsert targeting a different table", () => {
+  using database = new Database(":memory:");
+  const statements: string[] = [];
+
+  const sql = makeClient(database, (text) => {
+    statements.push(text);
+  });
+
+  const other = Table.withNaming("snake_case").fromSchema(
+    "other",
+    totals.select
+  );
+
+  database.run(
+    "CREATE TABLE other (item_id INTEGER PRIMARY KEY, hit_count INTEGER)"
+  );
+  database.run("INSERT INTO other VALUES (1, 17)");
+
+  let captured: Expression<typeof Schema.Int> | undefined;
+
+  const origin = sqlite
+    .insertInto(totals)
+    .values({ itemId: 1, hitCount: 2 })
+    .onConflictDoUpdate("itemId", ({ incoming }) => {
+      const value = incoming("hitCount");
+      captured = value;
+
+      return { hitCount: value };
+    });
+
+  Effect.runSync(origin.compile("sqlite"));
+
+  if (captured === undefined) {
+    throw new Error("Expected the upsert callback to run");
+  }
+
+  const query = sqlite
+    .insertInto(other)
+    .values({ itemId: 1, hitCount: 3 })
+    // @ts-expect-error Bypass static scope checks to exercise the runtime guard.
+    .onConflictDoUpdate("itemId", { hitCount: captured });
+
+  expect(
+    Effect.runSync(
+      Effect.result(Effect.provideService(query, SqlClient.SqlClient, sql))
+    )
+  ).toMatchObject({ _tag: "Failure", failure: { _tag: "WriteInputError" } });
+  expect(statements).toEqual([]);
+  expect(database.query("SELECT * FROM other").all()).toEqual([
+    { item_id: 1, hit_count: 17 },
+  ]);
+});
+
+test("rejects case-insensitive write column collisions on SQLite and MySQL", () => {
+  using database = new Database(":memory:");
+  const statements: string[] = [];
+
+  const sql = makeClient(database, (text) => {
+    statements.push(text);
+  });
+
+  const collision = Table.fromSchema(
+    "totals",
+    Schema.Struct({ first: Schema.Int, second: Schema.Int }),
+    { columns: { first: { name: "Hits" }, second: { name: "HITS" } } }
+  );
+
+  database.run('CREATE TABLE totals ("hits" INTEGER)');
+  database.run("INSERT INTO totals VALUES (2)");
+
+  const query = update(collision).set({ first: 8, second: 9 });
+
+  expect(
+    Effect.runSync(
+      Effect.result(Effect.provideService(query, SqlClient.SqlClient, sql))
+    )
+  ).toMatchObject({ _tag: "Failure", failure: { _tag: "WriteInputError" } });
+  expect(statements).toEqual([]);
+  expect(database.query("SELECT * FROM totals").all()).toEqual([{ hits: 2 }]);
+  expect(Effect.runSync(Effect.result(query.compile("mysql")))).toMatchObject({
+    _tag: "Failure",
+    failure: { _tag: "WriteInputError" },
+  });
+  expect(Effect.runSync(query.compile("pg"))).toEqual({
+    params: [8, 9],
+    sql: 'UPDATE "totals" SET "Hits" = $1, "HITS" = $2',
   });
 });

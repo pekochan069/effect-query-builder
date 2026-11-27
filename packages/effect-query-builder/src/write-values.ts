@@ -97,9 +97,12 @@ export const assertWriteReferences = (
   }
 };
 
+const isOptionalEncodedField = (field: Schema.Constraint) =>
+  SchemaAST.isOptional(SchemaAST.toEncoded(field.ast));
+
 export const requiredWriteKeys = (schema: RowSchema) =>
   Object.entries(schema.fields).flatMap(([key, field]) =>
-    SchemaAST.isOptional(SchemaAST.toEncoded(field.ast)) ? [] : [key]
+    isOptionalEncodedField(field) ? [] : [key]
   );
 
 export const encodeWriteRow = (
@@ -162,7 +165,7 @@ export const encodeWriteRow = (
             )
           );
 
-    const boundValues = new Map(
+    const boundValues = new Map<string, unknown>(
       Object.entries(
         yield* Schema.encodeEffect(valueSchema)(Object.fromEntries(values))
       )
@@ -170,10 +173,17 @@ export const encodeWriteRow = (
 
     const assignments: WriteAssignment<Statement.Fragment>[] = [];
 
-    for (const key of Object.keys(schema.fields)) {
+    for (const [key, field] of Object.entries(schema.fields)) {
       const expression = expressions.get(key);
+      const value = boundValues.get(key);
 
-      if (expression === undefined && !boundValues.has(key)) {
+      if (expression === undefined && value === undefined) {
+        if (boundValues.has(key) && !isOptionalEncodedField(field)) {
+          return yield* new WriteInputError({
+            message: `Column ${key} cannot bind undefined`,
+          });
+        }
+
         continue;
       }
 
@@ -187,7 +197,7 @@ export const encodeWriteRow = (
 
       assignments.push({
         column: column.name,
-        value: expression ?? writeParameter(boundValues.get(key)),
+        value: expression ?? writeParameter(value),
       });
     }
 

@@ -14,6 +14,7 @@ import {
 import * as mysql from "effect-query-builder/mysql";
 import * as pg from "effect-query-builder/pg";
 import * as sqlite from "effect-query-builder/sqlite";
+import { Model } from "effect/schema";
 import { Statement } from "effect/sql";
 import type { SqlClient } from "effect/sql";
 
@@ -27,6 +28,24 @@ const accounts = Table.fromSchema(
 const shadow = Table.fromSchema(
   "shadow",
   Schema.Struct({ id: UserId, label: Schema.String, count: Schema.Int })
+);
+
+class Account extends Model.Class<Account>("Account")({
+  id: UserId,
+  label: Schema.String,
+  count: Schema.Int,
+}) {
+  describe() {
+    return this.label;
+  }
+}
+
+const modelAccount = Table.fromModel("model_account", Account);
+
+export const modelCopy = insertInto(accounts).fromSelect(from(modelAccount));
+
+export const derivedModelCopy = insertInto(accounts).fromSelect(
+  from(alias(from(modelAccount).as("derived_account"), "aliased_account"))
 );
 
 const optionalCounts = Table.fromSchema(
@@ -57,6 +76,9 @@ const incompatibleCopy = from(shadow).select({
 });
 
 const incompleteCopy = from(shadow).select({ count: shadow.c.count });
+
+const nestedCopy = from(shadow).select({ ...shadow.c, nested: shadow });
+const derivedNestedCopy = from(nestedCopy.as("derived_nested"));
 
 const numberFromText = raw(
   Schema.NumberFromString,
@@ -184,6 +206,10 @@ export const rejectedWrites = () => {
   mysql.insertInto(accounts).fromSelect(pgCopy);
   // @ts-expect-error SELECT must provide the required insert columns.
   insertInto(accounts).fromSelect(incompleteCopy);
+  // @ts-expect-error SELECT has to contain only scalar projections.
+  insertInto(accounts).fromSelect(nestedCopy);
+  // @ts-expect-error A derived SELECT has to contain only scalar projections.
+  insertInto(accounts).fromSelect(derivedNestedCopy);
   // @ts-expect-error SELECT cannot send a nullable value to a required non-nullable column.
   insertInto(accounts).fromSelect(nullableCopy);
   // @ts-expect-error SELECT cannot send values with incompatible encodings.
@@ -192,4 +218,13 @@ export const rejectedWrites = () => {
   insertInto(accounts).fromSelect(textAsCountCopy);
   // @ts-expect-error SQL emits text even though the raw expression decodes to a number.
   update(accounts).set({ count: numberFromText });
+  insertInto(accounts)
+    .values(item)
+    .onConflictDoUpdate("id", ({ incoming }) => {
+      const count = incoming("count");
+      // @ts-expect-error An incoming column belongs to its own write target.
+      insertInto(shadow).values(item).onConflictDoUpdate("id", { count });
+
+      return { count };
+    });
 };

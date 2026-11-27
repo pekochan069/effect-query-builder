@@ -1,5 +1,6 @@
 import { Array as Arr, Effect, Effectable, Predicate } from "effect";
 import type { Schema } from "effect";
+import { map as mapArray } from "effect/Array";
 import { flatMap, forEach, map } from "effect/Effect";
 import { identity } from "effect/Function";
 import { SqlClient } from "effect/sql";
@@ -21,7 +22,6 @@ import type {
 import type {
   Expression as Node,
   InsertConflict,
-  Projection,
   Statement as QueryStatement,
 } from "./kernel/ast.ts";
 import type { CompileTarget, SqlDialect } from "./kernel/compile.ts";
@@ -34,7 +34,12 @@ import type {
   Selected,
 } from "./select-projection.ts";
 import { isSource } from "./select-source.ts";
-import type { ScalarEncoded, ScalarKey, ScalarValue } from "./select-source.ts";
+import type {
+  NonScalarKey,
+  ScalarEncoded,
+  ScalarKey,
+  ScalarValue,
+} from "./select-source.ts";
 import { QueryTypeId } from "./select.ts";
 import type { OperandDialect, QueryOperand } from "./select.ts";
 import { isColumn } from "./table.ts";
@@ -65,10 +70,6 @@ type WriteAst = Extract<
 type WriteKind = WriteAst["kind"];
 
 type WriteError = Schema.SchemaError | SqlError.SqlError | WriteInputError;
-
-type Encoders<T extends TableSource, K extends WriteKind> = K extends "update"
-  ? T["update"]["EncodingServices"]
-  : never;
 
 type InputRows<S extends RowSchema> = WriteInput<S> | readonly WriteInput<S>[];
 
@@ -127,7 +128,7 @@ type InvalidSelectFields<S extends RowSchema, Q extends QueryOperand> = {
 type CheckInsertSelect<S extends RowSchema, Q extends QueryOperand> = [
   | Exclude<RequiredEncodedKeys<S>, SelectKeys<Q>>
   | Exclude<SelectKeys<Q>, StringKey<keyof S["fields"]>>
-  | Exclude<StringKey<keyof SelectRow<Q>>, SelectKeys<Q>>
+  | NonScalarKey<SelectProjection<Q>>
   | InvalidSelectFields<S, Q>,
 ] extends [never]
   ? [SelectKeys<Q>] extends [never]
@@ -239,7 +240,7 @@ type ConflictDialect = "pg" | "sqlite";
 
 type IncomingColumn<C extends Column> = Expression<
   C["schema"],
-  never,
+  C,
   SqlDialect,
   C["schema"]["Encoded"]
 >;
@@ -318,8 +319,8 @@ type ChangeQuery<
   T extends TableSource,
   D extends SqlDialect,
   M extends boolean,
-  R = Encoders<T, K>,
-  P extends ReturningSelection = never,
+  R,
+  P extends ReturningSelection,
 > = WriteResultEffect<WriteResult<P>, D, R, WriteDecoders<P>> &
   Returning<K, T, D, M, R> & {
     readonly where: <const Predicate extends PredicateInput>(
@@ -388,20 +389,16 @@ export interface WriteEntrypoints<D extends SqlDialect, M extends boolean> {
 const defaultValue = { kind: "defaultValue" } as const;
 const insertSourceAlias = "__eqb_insert_source";
 
-const insertRows = (
-  table: TableSource,
-  input: WriteRow | readonly WriteRow[]
-) =>
+const snapshotRow = (row: WriteRow) =>
+  Predicate.isObject(row) && !Arr.isArray(row) ? { ...row } : row;
+
+const insertRows = (table: TableSource, rows: readonly WriteRow[]) =>
   Effect.gen(function* buildInsert() {
     if (table.alias !== undefined) {
       return yield* new WriteInputError({
         message: "INSERT requires an unaliased table",
       });
     }
-
-    const rows = Arr.isArray<WriteRow | readonly WriteRow[]>(input)
-      ? input
-      : [input];
 
     if (!Arr.isReadonlyArrayNonEmpty(rows)) {
       return yield* new WriteInputError({
@@ -432,7 +429,7 @@ const insertRows = (
 
     const [firstColumn, ...restColumns] = columns;
 
-    const renderedRows = encoded.map((row) => {
+    const renderedRows = mapArray(encoded, (row) => {
       const values = new Map(row.map(({ column, value }) => [column, value]));
       const value = (column: string) => values.get(column) ?? defaultValue;
 
@@ -440,12 +437,6 @@ const insertRows = (
         Node<Statement.Fragment>
       >;
     });
-
-    if (!Arr.isReadonlyArrayNonEmpty(renderedRows)) {
-      return yield* new WriteInputError({
-        message: "INSERT requires at least one row",
-      });
-    }
 
     return {
       columns,
@@ -455,8 +446,16 @@ const insertRows = (
     } satisfies WriteAst;
   });
 
-const insertSelect = (table: TableSource, query: QueryOperand) =>
-  Effect.gen(function* buildInsertSelect() {
+const insertSelect = (table: TableSource, query: QueryOperand) => {
+  if (table.insert.ast.checks !== undefined) {
+    return Effect.fail(
+      new WriteInputError({
+        message: "INSERT SELECT cannot be used with whole-row write checks",
+      })
+    );
+  }
+
+  return Effect.gen(function* buildInsertSelect() {
     if (table.alias !== undefined) {
       return yield* new WriteInputError({
         message: "INSERT requires an unaliased table",
@@ -485,7 +484,7 @@ const insertSelect = (table: TableSource, query: QueryOperand) =>
     }
 
     const columns: string[] = [];
-    const projections: Projection<Statement.Fragment>[] = [];
+    const selectedAliases: string[] = [];
 
     for (const key of keys) {
       const field = plan.fields[key];
@@ -514,37 +513,46 @@ const insertSelect = (table: TableSource, query: QueryOperand) =>
       }
 
       columns.push(column.name);
-      projections.push({
-        expression: {
-          kind: "column",
-          name: field.alias,
-          table: insertSourceAlias,
-        },
-      });
+      selectedAliases.push(field.alias);
     }
 
     if (
       !Arr.isReadonlyArrayNonEmpty(columns) ||
-      !Arr.isReadonlyArrayNonEmpty(projections)
+      !Arr.isReadonlyArrayNonEmpty(selectedAliases)
     ) {
       return yield* new WriteInputError({
         message: "INSERT SELECT requires named scalar projections",
       });
     }
 
+    const direct =
+      ast.projections.length === selectedAliases.length &&
+      ast.projections.every(
+        ({ alias }, index) => alias === selectedAliases[index]
+      );
+
     return {
       columns,
       kind: "insert",
-      select: {
-        from: {
-          relation: { alias: insertSourceAlias, kind: "subquery", query: ast },
-        },
-        kind: "select",
-        projections,
-      },
+      select: direct
+        ? ast
+        : {
+            from: {
+              relation: {
+                alias: insertSourceAlias,
+                kind: "subquery",
+                query: ast,
+              },
+            },
+            kind: "select",
+            projections: mapArray(selectedAliases, (name) => ({
+              expression: { kind: "column", name, table: insertSourceAlias },
+            })),
+          },
       table: table.identifier,
     } satisfies WriteAst;
   });
+};
 
 const requiredAssignments = (
   table: TableSource,
@@ -584,18 +592,23 @@ const operation = {
 const conflictColumns = (
   table: TableSource,
   target: string | readonly string[]
-) =>
-  Effect.gen(function* resolveConflictColumns() {
-    const keys = Predicate.isString(target) ? [target] : target;
+) => {
+  const keys = Predicate.isString(target) ? [target] : target;
+
+  if (!Arr.isArray(keys)) {
+    return Effect.fail(
+      new WriteInputError({
+        message: "A conflict target needs distinct columns",
+      })
+    );
+  }
+
+  const snapshot = [...keys];
+
+  return Effect.gen(function* resolveConflictColumns() {
     const columns: string[] = [];
 
-    if (!Arr.isArray(keys)) {
-      return yield* new WriteInputError({
-        message: "A conflict target needs distinct columns",
-      });
-    }
-
-    for (const key of keys) {
+    for (const key of snapshot) {
       const column = Object.hasOwn(table.c, key) ? table.c[key] : undefined;
 
       if (column === undefined) {
@@ -618,6 +631,7 @@ const conflictColumns = (
 
     return columns;
   });
+};
 
 const incomingColumn = (target: TableSource, key: string) => {
   const column = Object.hasOwn(target.c, key) ? target.c[key] : undefined;
@@ -629,7 +643,7 @@ const incomingColumn = (target: TableSource, key: string) => {
   return makeExpression(
     column.schema,
     { kind: "incomingColumn", name: column.name },
-    []
+    [column]
   ) satisfies IncomingColumn<Column>;
 };
 
@@ -637,14 +651,19 @@ const upsertAssignments = (
   target: TableSource,
   patch: UpsertPatch<TableSource, WriteRow>,
   clause: string
-) =>
-  Effect.gen(function* buildUpsertAssignments() {
+) => {
+  if (!Predicate.isFunction(patch)) {
+    return requiredAssignments(target, snapshotRow(patch), clause);
+  }
+
+  return Effect.gen(function* buildUpsertAssignments() {
     let values: WriteRow;
 
     try {
-      values = Predicate.isFunction(patch)
-        ? patch({ target, incoming: (key) => incomingColumn(target, key) })
-        : patch;
+      values = patch({
+        target,
+        incoming: (key) => incomingColumn(target, key),
+      });
     } catch (error) {
       if (error instanceof WriteInputError) {
         return yield* error;
@@ -655,6 +674,7 @@ const upsertAssignments = (
 
     return yield* requiredAssignments(target, values, clause);
   });
+};
 
 interface WriteState {
   readonly target: TableSource;
@@ -725,10 +745,12 @@ class Write extends Effectable.Class<
     patch: UpsertPatch<TableSource, WriteRow>
   ) {
     const table = this.#state.target;
+    const conflictTarget = conflictColumns(table, target);
+    const conflictAssignments = upsertAssignments(table, patch, "DO UPDATE");
 
     const conflict = Effect.gen(function* buildConflict() {
-      const columns = yield* conflictColumns(table, target);
-      const assignments = yield* upsertAssignments(table, patch, "DO UPDATE");
+      const columns = yield* conflictTarget;
+      const assignments = yield* conflictAssignments;
 
       return {
         assignments,
@@ -808,7 +830,15 @@ class Write extends Effectable.Class<
     dialect: SqlDialect,
     render: (ast: WriteAst, target: CompileTarget) => A
   ) {
-    const { build, kind, mariadb, predicate, projection } = this.#state;
+    const {
+      build,
+      kind,
+      mariadb,
+      predicate,
+      projection,
+      target: table,
+    } = this.#state;
+
     const op = operation[kind];
     const locked = this.#state.dialect;
 
@@ -817,6 +847,22 @@ class Write extends Effectable.Class<
         op,
         `${op} scoped to ${locked} is unsupported by the ${dialect} dialect`
       );
+    }
+
+    if (dialect !== "pg") {
+      const names = Object.values(table.c).map(({ name }) =>
+        dialect === "sqlite"
+          ? name.replaceAll(/[A-Z]/gu, (letter) => letter.toLowerCase())
+          : name.toLowerCase()
+      );
+
+      if (new Set(names).size !== names.length) {
+        return Effect.fail(
+          new WriteInputError({
+            message: `Write target column names must be distinct in ${dialect}`,
+          })
+        );
+      }
     }
 
     const target: CompileTarget =
@@ -907,21 +953,26 @@ export function writeForDialect(dialect?: SqlDialect, mariadb = false) {
             mariadb,
             target,
           }),
-        values: (input: WriteRow | readonly WriteRow[]) =>
-          new Write({
-            build: insertRows(target, input),
+        values: (input: WriteRow | readonly WriteRow[]) => {
+          const rows = Arr.isArray<WriteRow | readonly WriteRow[]>(input)
+            ? input
+            : [input];
+
+          return new Write({
+            build: insertRows(target, rows.map(snapshotRow)),
             dialect,
             kind: "insert",
             mariadb,
             target,
-          }),
+          });
+        },
       };
     },
     update(target: TableSource) {
       return {
         set: (input: WriteRow) =>
           new Write({
-            build: updateAssignments(target, input),
+            build: updateAssignments(target, snapshotRow(input)),
             dialect,
             kind: "update",
             mariadb,
