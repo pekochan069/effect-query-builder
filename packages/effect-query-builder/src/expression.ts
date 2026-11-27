@@ -14,6 +14,7 @@ const OrderingTypeId = Symbol("effect-query-builder/Ordering");
 declare const ExpressionDialectTypeId: unique symbol;
 declare const ExpressionSqlValueTypeId: unique symbol;
 declare const ProjectedSqlValueTypeId: unique symbol;
+declare const UnknownRawSqlValue: unique symbol;
 
 export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
@@ -88,9 +89,11 @@ export interface ProjectedSqlValue<Value> {
 export type SqlValue<Input> = Input extends Column
   ? Input["schema"]["Encoded"]
   : Input extends Expression<infer S, Column, SqlDialect, infer Value>
-    ? unknown extends Value
-      ? S["Type"]
-      : Value
+    ? Value extends typeof UnknownRawSqlValue
+      ? unknown
+      : unknown extends Value
+        ? S["Type"]
+        : Value
     : Input extends Statement.Fragment
       ? unknown
       : Input;
@@ -720,7 +723,13 @@ export const max = extremum("MAX");
 export const raw = <S extends Schema.Constraint>(
   schema: S,
   fragment: Statement.Fragment
-) => makeExpression(schema, toExpressionNode(fragment), []);
+) =>
+  makeExpression<
+    S,
+    never,
+    SqlDialect,
+    unknown extends S["Encoded"] ? typeof UnknownRawSqlValue : S["Encoded"]
+  >(schema, toExpressionNode(fragment), []);
 
 const ordering =
   (direction: Ordering["direction"]) =>

@@ -48,6 +48,7 @@ export type Expression<Raw = never> =
       readonly value: boolean;
     }
   | { readonly kind: "nullLiteral" }
+  | { readonly kind: "defaultValue" }
   | {
       readonly kind: "binary";
       readonly operator: BinaryOperator;
@@ -164,30 +165,41 @@ export interface SelectStatement<Raw = never> {
   }[];
 }
 
-interface InsertStatement {
+interface WriteTarget<Raw> {
+  readonly table: QualifiedName;
+  readonly returning?: NonEmpty<Projection<Raw>>;
+}
+
+export type InsertStatement<Raw = never> = WriteTarget<Raw> & {
   readonly kind: "insert";
-  readonly table: QualifiedName;
-  readonly columns: NonEmpty<string>;
-  readonly rows: NonEmpty<NonEmpty<Expression>>;
-  readonly returning?: NonEmpty<Projection>;
+} & (
+    | {
+        readonly columns: NonEmpty<string>;
+        readonly rows: NonEmpty<NonEmpty<Expression<Raw>>>;
+      }
+    | {
+        readonly columns: NonEmpty<string>;
+        readonly select: SelectStatement<Raw>;
+      }
+    | { readonly defaultRows: number; readonly defaultColumn?: string }
+  );
+
+export interface WriteAssignment<Raw = never> {
+  readonly column: string;
+  readonly value: Expression<Raw>;
 }
 
-interface UpdateStatement {
+export interface UpdateStatement<Raw = never> extends WriteTarget<Raw> {
   readonly kind: "update";
-  readonly table: QualifiedName;
-  readonly assignments: NonEmpty<{
-    readonly column: string;
-    readonly value: Expression;
-  }>;
-  readonly where?: Expression;
-  readonly returning?: NonEmpty<Projection>;
+  readonly alias?: string;
+  readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+  readonly where?: Expression<Raw>;
 }
 
-interface DeleteStatement {
+export interface DeleteStatement<Raw = never> extends WriteTarget<Raw> {
   readonly kind: "delete";
-  readonly table: QualifiedName;
-  readonly where?: Expression;
-  readonly returning?: NonEmpty<Projection>;
+  readonly alias?: string;
+  readonly where?: Expression<Raw>;
 }
 
 interface CreateTableStatement {
@@ -209,8 +221,8 @@ interface DropTableStatement {
 
 export type Statement<Raw = never> =
   | SelectStatement<Raw>
-  | InsertStatement
-  | UpdateStatement
-  | DeleteStatement
+  | InsertStatement<Raw>
+  | UpdateStatement<Raw>
+  | DeleteStatement<Raw>
   | CreateTableStatement
   | DropTableStatement;

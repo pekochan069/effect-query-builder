@@ -1,11 +1,14 @@
 import type {
+  DeleteStatement,
   Expression,
+  InsertStatement,
   Join,
   Projection,
   QualifiedName,
   Relation,
   SelectStatement,
   Statement,
+  UpdateStatement,
 } from "./ast.ts";
 import { UnsupportedDialectClauseError } from "./errors.ts";
 import {
@@ -20,8 +23,8 @@ export type SqlDialect = "pg" | "sqlite" | "mysql";
 
 type DialectProfile = SqlDialect | "portable" | "mariadb";
 
-type WriteStatement = Extract<
-  Statement,
+type WriteStatement<Raw = never> = Extract<
+  Statement<Raw>,
   { kind: "insert" | "update" | "delete" }
 >;
 
@@ -31,6 +34,10 @@ type CompilerToken<Raw> =
   | SqlToken
   | { readonly kind: "identifier"; readonly name: string }
   | { readonly kind: "raw"; readonly value: Raw };
+
+type ColumnQualifier =
+  | { readonly kind: "unqualified" }
+  | { readonly kind: "replace"; readonly from: string; readonly to: string };
 
 const joinSql = {
   cross: "CROSS JOIN",
@@ -60,6 +67,7 @@ class Compiler<Raw> {
   readonly #dialect: SqlDialect | undefined;
   readonly #profile: DialectProfile | undefined;
   readonly #write: (token: CompilerToken<Raw>) => void;
+  #qualifier?: ColumnQualifier;
 
   constructor(
     target: CompileTarget | undefined,
@@ -249,13 +257,23 @@ class Compiler<Raw> {
     this.#text(")");
   }
 
+  #column(expression: Extract<Expression<Raw>, { kind: "column" }>) {
+    const qualifier = this.#qualifier;
+    let schema = expression.table;
+
+    if (qualifier?.kind === "unqualified") {
+      schema = undefined;
+    } else if (qualifier?.kind === "replace" && schema === qualifier.from) {
+      schema = qualifier.to;
+    }
+
+    this.#qualifiedName({ name: expression.name, schema });
+  }
+
   #expression(expression: Expression<Raw>) {
     switch (expression.kind) {
       case "column": {
-        this.#qualifiedName({
-          name: expression.name,
-          schema: expression.table,
-        });
+        this.#column(expression);
 
         return;
       }
@@ -286,6 +304,13 @@ class Compiler<Raw> {
 
       case "nullLiteral": {
         this.#text("NULL");
+
+        return;
+      }
+
+      case "defaultValue": {
+        this.#requireDialect("DEFAULT in VALUES", "pg", "mysql");
+        this.#text("DEFAULT");
 
         return;
       }
@@ -535,8 +560,21 @@ class Compiler<Raw> {
 
   #subquery(query: SelectStatement<Raw>) {
     this.#text("(");
-    this.#select(query);
+    this.#withQualifier(undefined, () => {
+      this.#select(query);
+    });
     this.#text(")");
+  }
+
+  #withQualifier(qualifier: ColumnQualifier | undefined, render: () => void) {
+    const current = this.#qualifier;
+    this.#qualifier = qualifier;
+
+    try {
+      render();
+    } finally {
+      this.#qualifier = current;
+    }
   }
 
   #predicate(
@@ -671,39 +709,92 @@ class Compiler<Raw> {
     }
   }
 
-  #returning(statement: WriteStatement) {
-    if (statement.returning !== undefined) {
+  #returning(statement: WriteStatement<Raw>) {
+    const { returning } = statement;
+
+    if (returning !== undefined) {
       this.#requireClause(`${statement.kind}Returning`, "RETURNING");
       this.#text(" RETURNING ");
-      this.#projections(statement.returning);
+
+      if (this.#dialect === "sqlite") {
+        this.#withQualifier({ kind: "unqualified" }, () => {
+          this.#projections(returning);
+        });
+      } else {
+        this.#projections(returning);
+      }
     }
   }
 
-  #insert(statement: Extract<WriteStatement, { kind: "insert" }>) {
+  #insert(statement: InsertStatement<Raw>) {
     this.#text("INSERT INTO ");
     this.#qualifiedName(statement.table);
+
+    if ("defaultRows" in statement) {
+      this.#defaultInsert(statement.defaultRows, statement.defaultColumn);
+      this.#returning(statement);
+
+      return;
+    }
+
     this.#text(" (");
     this.#list(statement.columns, (column) => {
       this.#identifier(column);
     });
-    this.#text(") VALUES ");
-    this.#list(statement.rows, (row) => {
-      if (row.length !== statement.columns.length) {
-        throw new TypeError("Each INSERT row must match the column count");
-      }
+    this.#text(") ");
 
-      this.#text("(");
-      this.#list(row, (value) => {
-        this.#expression(value);
+    if ("select" in statement) {
+      this.#select(statement.select);
+    } else {
+      this.#text("VALUES ");
+      this.#list(statement.rows, (row) => {
+        if (row.length !== statement.columns.length) {
+          throw new TypeError("Each INSERT row must match the column count");
+        }
+
+        this.#text("(");
+        this.#list(row, (value) => {
+          this.#expression(value);
+        });
+        this.#text(")");
       });
-      this.#text(")");
-    });
+    }
+
     this.#returning(statement);
   }
 
-  #update(statement: Extract<WriteStatement, { kind: "update" }>) {
+  #defaultInsert(count: number, column: string | undefined) {
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw new TypeError("INSERT requires at least one row");
+    }
+
+    if (this.#dialect === "mysql") {
+      this.#text(` () VALUES ()${", ()".repeat(count - 1)}`);
+    } else if (count === 1) {
+      this.#text(" DEFAULT VALUES");
+    } else {
+      this.#requireDialect("Bulk default-only INSERT", "pg");
+
+      if (column === undefined) {
+        throw new TypeError(
+          "Bulk default-only INSERT requires a target column"
+        );
+      }
+
+      this.#text(" (");
+      this.#identifier(column);
+      this.#text(`) VALUES (DEFAULT)${", (DEFAULT)".repeat(count - 1)}`);
+    }
+  }
+
+  #update(statement: UpdateStatement<Raw>) {
     this.#text("UPDATE ");
     this.#qualifiedName(statement.table);
+
+    if (statement.alias !== undefined) {
+      this.#alias(statement.alias);
+    }
+
     this.#text(" SET ");
     this.#list(statement.assignments, ({ column, value }) => {
       this.#identifier(column);
@@ -714,11 +805,31 @@ class Compiler<Raw> {
     this.#returning(statement);
   }
 
-  #delete(statement: Extract<WriteStatement, { kind: "delete" }>) {
-    this.#text("DELETE FROM ");
-    this.#qualifiedName(statement.table);
-    this.#predicate("WHERE", statement.where);
-    this.#returning(statement);
+  #delete(statement: DeleteStatement<Raw>) {
+    const { alias, table } = statement;
+    const lowerAlias = alias !== undefined && this.#profile === "mariadb";
+
+    this.#text("DELETE ");
+
+    if (alias !== undefined && this.#dialect === "mysql" && !lowerAlias) {
+      this.#identifier(alias);
+      this.#text(" ");
+    }
+
+    this.#text("FROM ");
+    this.#qualifiedName(table);
+
+    if (alias !== undefined && !lowerAlias) {
+      this.#alias(alias);
+    }
+
+    this.#withQualifier(
+      lowerAlias ? { kind: "replace", from: alias, to: table.name } : undefined,
+      () => {
+        this.#predicate("WHERE", statement.where);
+        this.#returning(statement);
+      }
+    );
   }
 
   #createTable(statement: Extract<Statement, { kind: "createTable" }>) {
