@@ -4,15 +4,22 @@ import {
   Effect,
   Effectable,
   Predicate,
+  Schema,
   Stream,
 } from "effect";
-import type { Option, Schema, Types } from "effect";
+import type { Option, Types } from "effect";
 import { flatMap, forEach, map } from "effect/Effect";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
 
-import { isExpression, isOrdering, toExpressionNode } from "./expression.ts";
+import {
+  isExpression,
+  isOrdering,
+  makeExpression,
+  toExpressionNode,
+} from "./expression.ts";
 import type {
+  Expression as SelectExpression,
   ExpressionInput,
   ExpressionReferences,
   Ordering,
@@ -33,17 +40,27 @@ import type {
   Selected,
   Selection,
 } from "./select-projection.ts";
-import { isColumn, isTableSource } from "./table.ts";
-import type { TableSource } from "./table.ts";
+import {
+  isDerivedSource,
+  isSource,
+  makeDerivedSource,
+} from "./select-source.ts";
+import type {
+  DerivedSelection,
+  ScalarKey,
+  ScalarSchema,
+  Source,
+  SourceDialect,
+} from "./select-source.ts";
+import { isColumn } from "./table.ts";
 
-type Scope = Readonly<Record<string, TableSource>>;
+type Scope = Readonly<Record<string, Source>>;
 
 const emptyScope = Object.freeze({});
 
 type EmptyScope = typeof emptyScope;
 
-type AddSource<S extends Scope, T extends TableSource> = S &
-  Readonly<Record<T["name"], T>>;
+type SourceEntry<T extends Source> = Readonly<Record<T["name"], T>>;
 
 type Scoped<T, S extends Scope = Scope> = T | ((tables: S) => T);
 
@@ -52,6 +69,10 @@ type SqlExpression = Expression<Statement.Fragment>;
 type SelectAst = SelectStatement<Statement.Fragment>;
 
 type SelectJoin = Join<Statement.Fragment>;
+
+type Cte = NonNullable<SelectAst["with"]>[number];
+
+type SetOperator = NonNullable<SelectAst["sets"]>[number]["operator"];
 
 type SelectError = SqlError.SqlError | Schema.SchemaError;
 
@@ -67,7 +88,7 @@ type CheckInput<Input, S extends Scope> = [
   ? unknown
   : never;
 
-type CheckSelectionItem<Item, S extends Scope> = Item extends TableSource
+type CheckSelectionItem<Item, S extends Scope> = Item extends Source
   ? Item extends S[keyof S]
     ? unknown
     : never
@@ -77,21 +98,21 @@ type InvalidSelection<P extends Selection, S extends Scope> = {
   [K in keyof P]: CheckSelectionItem<P[K], S> extends never ? K : never;
 }[keyof P];
 
-type CheckSelection<
-  P extends Selection,
-  S extends Scope,
-> = P extends TableSource
+type CheckSelection<P extends Selection, S extends Scope> = P extends Source
   ? CheckSelectionItem<P, S>
   : [InvalidSelection<P, S>] extends [never]
     ? unknown
     : never;
 
-type CheckFrom<P extends Selection, T extends TableSource> = CheckSelection<
-  P,
-  AddSource<EmptyScope, T>
->;
+type FromProjection<P extends Selection, T extends Source> = [P] extends [never]
+  ? T
+  : P;
 
-type NewSource<S extends Scope, T extends TableSource> = T &
+type CheckFrom<P extends Selection, T extends Source> = [P] extends [never]
+  ? unknown
+  : CheckSelection<P, SourceEntry<T>>;
+
+type NewSource<S extends Scope, T extends Source> = T &
   (keyof S extends never ? never : T["name"] extends keyof S ? never : unknown);
 
 type Result<P extends Selection, N extends string, Override> = [
@@ -104,12 +125,49 @@ type Narrow<Row, Subset> = {
   readonly [K in keyof Row]: K extends keyof Subset ? Subset[K] : Row[K];
 };
 
+const QueryTypeId = Symbol("effect-query-builder/SelectQuery");
+
+interface QuerySnapshot<P extends Selection = Selection> {
+  readonly plan: ProjectionPlan;
+  readonly ast: SelectAst;
+  readonly selection: P;
+  readonly mysql: boolean;
+}
+
+interface QueryOperand extends Effect.Effect<
+  readonly unknown[],
+  SelectError,
+  unknown
+> {
+  readonly [QueryTypeId]: () => QuerySnapshot;
+  readonly compile: (dialect: never) => ReturnType<typeof compileSelect>;
+}
+
+type OperandRow<Q extends QueryOperand> = Effect.Success<Q>[number];
+
+type OperandDialect<Q extends QueryOperand> = Parameters<Q["compile"]>[0];
+
+type OperandSource<
+  Name extends string,
+  Q extends QueryOperand,
+> = DerivedSelection<
+  Name,
+  ReturnType<Q[typeof QueryTypeId]>["selection"],
+  OperandRow<Q>,
+  Exclude<Effect.Services<Q>, SqlClient.SqlClient>,
+  OperandDialect<Q>
+>;
+
+type SetOperand<Q extends QueryOperand, Row> = Q &
+  (Types.Equals<OperandRow<Q>, Row> extends true ? unknown : never);
+
 export interface SelectQuery<
   S extends Scope,
   P extends Selection,
   N extends string = never,
   D extends SelectDialect = SelectDialect,
   Override = never,
+  C extends Scope = EmptyScope,
 >
   extends
     Effect.Effect<
@@ -118,112 +176,147 @@ export interface SelectQuery<
       SqlClient.SqlClient | DecodeServices<P>
     >,
     Statement.Fragment {
-  readonly from: <const T extends TableSource>(
-    source: T &
-      (keyof S extends never ? unknown : never) &
-      CheckFrom<P, NoInfer<T>>
-  ) => SelectQuery<AddSource<S, T>, P, N, D, Override>;
+  readonly [QueryTypeId]: () => QuerySnapshot<P>;
+  readonly as: <const Name extends string>(
+    name: Name
+  ) => DerivedSelection<Name, P, Result<P, N, Override>, DecodeServices<P>, D>;
+  readonly scalar: <const Key extends ScalarKey<P>>(
+    key: Key
+  ) => SelectExpression<ScalarSchema<P, Key, Result<P, N, Override>>, never>;
+  readonly with: <const Name extends string, Q extends QueryOperand>(
+    name: Name & (Name extends keyof C ? never : unknown),
+    query: Scoped<Q, C>
+  ) => SelectQuery<
+    S,
+    P,
+    N,
+    D & OperandDialect<Q>,
+    Override,
+    C & SourceEntry<OperandSource<Name, Q>>
+  >;
+  readonly union: <Q extends QueryOperand>(
+    query: SetOperand<Q, Result<P, N, Override>>
+  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  readonly unionAll: <Q extends QueryOperand>(
+    query: SetOperand<Q, Result<P, N, Override>>
+  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  readonly intersect: <Q extends QueryOperand>(
+    query: SetOperand<Q, Result<P, N, Override>>
+  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  readonly except: <Q extends QueryOperand>(
+    query: SetOperand<Q, Result<P, N, Override>>
+  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  readonly from: <const T extends Source>(
+    source: Scoped<
+      T & (keyof S extends never ? unknown : never) & CheckFrom<P, NoInfer<T>>,
+      C
+    >
+  ) => SelectQuery<
+    S & SourceEntry<T>,
+    FromProjection<P, T>,
+    N,
+    D & SourceDialect<T>,
+    Override,
+    C
+  >;
   readonly select: <const Next extends Selection>(
     selection: Scoped<Next & CheckSelection<Next, S>, S>
-  ) => SelectQuery<S, Next, N, D>;
-  readonly innerJoin: <
-    const T extends TableSource,
-    const On extends PredicateInput,
-  >(
-    source: NewSource<S, T>,
+  ) => SelectQuery<S, Next, N, D, never, C>;
+  readonly innerJoin: <const T extends Source, const On extends PredicateInput>(
+    source: Scoped<NewSource<S, T>, C>,
     on: Scoped<
-      On & CheckInput<On, AddSource<S, NoInfer<T>>>,
-      AddSource<S, NoInfer<T>>
+      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      S & SourceEntry<NoInfer<T>>
     >
-  ) => SelectQuery<AddSource<S, T>, P, N, D, Override>;
-  readonly leftJoin: <
-    const T extends TableSource,
-    const On extends PredicateInput,
-  >(
-    source: NewSource<S, T>,
+  ) => SelectQuery<S & SourceEntry<T>, P, N, D & SourceDialect<T>, Override, C>;
+  readonly leftJoin: <const T extends Source, const On extends PredicateInput>(
+    source: Scoped<NewSource<S, T>, C>,
     on: Scoped<
-      On & CheckInput<On, AddSource<S, NoInfer<T>>>,
-      AddSource<S, NoInfer<T>>
-    >
-  ) => SelectQuery<AddSource<S, T>, P, N | T["name"], D, Override>;
-  readonly rightJoin: <
-    const T extends TableSource,
-    const On extends PredicateInput,
-  >(
-    source: NewSource<S, T>,
-    on: Scoped<
-      On & CheckInput<On, AddSource<S, NoInfer<T>>>,
-      AddSource<S, NoInfer<T>>
+      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      S & SourceEntry<NoInfer<T>>
     >
   ) => SelectQuery<
-    AddSource<S, T>,
+    S & SourceEntry<T>,
+    P,
+    N | T["name"],
+    D & SourceDialect<T>,
+    Override,
+    C
+  >;
+  readonly rightJoin: <const T extends Source, const On extends PredicateInput>(
+    source: Scoped<NewSource<S, T>, C>,
+    on: Scoped<
+      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      S & SourceEntry<NoInfer<T>>
+    >
+  ) => SelectQuery<
+    S & SourceEntry<T>,
     P,
     N | Extract<keyof S, string>,
-    D,
-    Override
+    D & SourceDialect<T>,
+    never,
+    C
   >;
-  readonly fullJoin: <
-    const T extends TableSource,
-    const On extends PredicateInput,
-  >(
-    source: NewSource<S, T>,
+  readonly fullJoin: <const T extends Source, const On extends PredicateInput>(
+    source: Scoped<NewSource<S, T>, C>,
     on: Scoped<
-      On & CheckInput<On, AddSource<S, NoInfer<T>>>,
-      AddSource<S, NoInfer<T>>
+      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      S & SourceEntry<NoInfer<T>>
     >
   ) => SelectQuery<
-    AddSource<S, T>,
+    S & SourceEntry<T>,
     P,
     N | Extract<keyof S, string> | T["name"],
-    Exclude<D, "mysql">,
-    Override
+    Exclude<D & SourceDialect<T>, "mysql">,
+    never,
+    C
   >;
-  readonly crossJoin: <const T extends TableSource>(
-    source: NewSource<S, T>
-  ) => SelectQuery<AddSource<S, T>, P, N, D, Override>;
+  readonly crossJoin: <const T extends Source>(
+    source: Scoped<NewSource<S, T>, C>
+  ) => SelectQuery<S & SourceEntry<T>, P, N, D & SourceDialect<T>, Override, C>;
   readonly where: <const T extends PredicateInput>(
     predicate: Scoped<T & CheckInput<T, S>, S>
-  ) => SelectQuery<S, P, N, D, Override>;
+  ) => SelectQuery<S, P, N, D, Override, C>;
   readonly having: <const T extends PredicateInput>(
     predicate: Scoped<T & CheckInput<T, S>, S>
-  ) => SelectQuery<S, P, N, D, Override>;
+  ) => SelectQuery<S, P, N, D, Override, C>;
   readonly groupBy: {
     <const T extends readonly ExpressionInput[]>(
       ...items: T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
     <const T extends ExpressionInput>(
       item: (tables: S) => T & CheckInput<T, S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
     <const T extends readonly ExpressionInput[]>(
       items: (tables: S) => T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
   };
   readonly orderBy: {
     <const T extends readonly OrderItem[]>(
       ...items: T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
     <const T extends OrderItem>(
       item: (tables: S) => T & CheckInput<T, S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
     <const T extends readonly OrderItem[]>(
       items: (tables: S) => T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override>;
+    ): SelectQuery<S, P, N, D, Override, C>;
   };
-  readonly limit: (count: number) => SelectQuery<S, P, N, D, Override>;
-  readonly offset: (count: number) => SelectQuery<S, P, N, D, Override>;
-  readonly distinct: () => SelectQuery<S, P, N, D, Override>;
+  readonly limit: (count: number) => SelectQuery<S, P, N, D, Override, C>;
+  readonly offset: (count: number) => SelectQuery<S, P, N, D, Override, C>;
+  readonly distinct: () => SelectQuery<S, P, N, D, Override, C>;
   readonly $if: (
     condition: boolean,
     apply: (
-      query: SelectQuery<S, P, N, D, Override>
-    ) => SelectQuery<S, P, N, D, Override>
-  ) => SelectQuery<S, P, N, D, Override>;
+      query: SelectQuery<S, P, N, D, Override, C>
+    ) => SelectQuery<S, P, N, D, Override, C>
+  ) => SelectQuery<S, P, N, D, Override, C>;
   readonly when: (
     condition: boolean,
     apply: (
-      query: SelectQuery<S, P, N, D, Override>
-    ) => SelectQuery<S, P, N, D, Override>
-  ) => SelectQuery<S, P, N, D, Override>;
+      query: SelectQuery<S, P, N, D, Override, C>
+    ) => SelectQuery<S, P, N, D, Override, C>
+  ) => SelectQuery<S, P, N, D, Override, C>;
   readonly $narrow: <T extends Partial<NonNullable<Result<P, N, Override>>>>(
     ...check: Exclude<
       keyof T,
@@ -231,12 +324,12 @@ export interface SelectQuery<
     > extends never
       ? []
       : [never]
-  ) => SelectQuery<S, P, N, D, Narrow<Result<P, N, Override>, T>>;
+  ) => SelectQuery<S, P, N, D, Narrow<Result<P, N, Override>, T>, C>;
   readonly $assertType: <T>(
     ...check: Types.Equals<Result<P, N, Override>, T> extends true
       ? []
       : [never]
-  ) => SelectQuery<S, P, N, D, T>;
+  ) => SelectQuery<S, P, N, D, T, C>;
   readonly compile: (dialect: D) => ReturnType<typeof compileSelect>;
   readonly toFragment: (dialect?: D) => Statement.Fragment;
   readonly findOne: () => Effect.Effect<
@@ -262,17 +355,23 @@ export interface SelectQuery<
 }
 
 type JoinedSource =
-  | { readonly kind: "cross"; readonly source: TableSource }
+  | { readonly kind: "cross"; readonly source: Source }
   | {
       readonly kind: Exclude<SelectJoin["kind"], "cross">;
-      readonly source: TableSource;
+      readonly source: Source;
       readonly on: SqlExpression;
     };
 
 interface SelectState {
-  readonly source?: TableSource;
+  readonly source?: Source;
   readonly joins: readonly JoinedSource[];
   readonly scope: Scope;
+  readonly ctes: Scope;
+  readonly with: readonly Cte[];
+  readonly sets: readonly {
+    readonly operator: SetOperator;
+    readonly operand: QuerySnapshot;
+  }[];
   readonly selection?: Selection;
   readonly nullable: ReadonlySet<string>;
   readonly mysql: boolean;
@@ -286,18 +385,21 @@ interface SelectState {
 }
 
 const empty: SelectState = {
+  ctes: emptyScope,
   groupBy: [],
   joins: [],
   mysql: true,
   nullable: new Set(),
   orderBy: [],
   scope: emptyScope,
+  sets: [],
+  with: [],
 };
 
 const resolve = <T>(scoped: Scoped<T>, scope: Scope) =>
   Predicate.isFunction(scoped) ? scoped(scope) : scoped;
 
-const addSource = (scope: Scope, source: TableSource) => {
+const addSource = (scope: Scope, source: Source) => {
   if (
     Object.keys(scope).some(
       (name) => name.toLowerCase() === source.name.toLowerCase()
@@ -333,12 +435,10 @@ const checkInput = (input: ExpressionInput, scope: Scope) => {
 };
 
 const checkSelection = (selection: Selection, scope: Scope) => {
-  const items = isTableSource(selection)
-    ? [selection]
-    : Object.values(selection);
+  const items = isSource(selection) ? [selection] : Object.values(selection);
 
   for (const item of items) {
-    if (!isTableSource(item)) {
+    if (!isSource(item)) {
       checkInput(item, scope);
     } else if (!Object.hasOwn(scope, item.name) || scope[item.name] !== item) {
       throw new TypeError(`Table ${item.name} is outside the SELECT scope`);
@@ -356,16 +456,49 @@ const constrain = (previous: SqlExpression | undefined, next: SqlExpression) =>
         right: next,
       } satisfies SqlExpression);
 
-const relation = (source: TableSource, plan: ProjectionPlan) =>
-  ({
-    alias: source.alias,
+const relation: (
+  source: Source,
+  plan: ProjectionPlan
+) => Relation<Statement.Fragment> = (source, plan) => {
+  const presence = plan.presence.get(source.name);
+
+  if (!isDerivedSource(source)) {
+    return {
+      alias: source.alias,
+      kind: "table",
+      name: source.identifier,
+      presence,
+    };
+  }
+
+  if (source.relation.kind === "subquery") {
+    return {
+      alias: source.name,
+      kind: "subquery",
+      presence,
+      query: source.relation.query,
+    };
+  }
+
+  const { name } = source.relation;
+
+  return {
+    alias: name === source.name ? undefined : source.name,
     kind: "table",
-    name: source.identifier,
-    presence: plan.presence.get(source.name),
-  }) satisfies Relation<Statement.Fragment>;
+    name: { name },
+    presence,
+  };
+};
+
+const supportsMysql = (source: Source) =>
+  !isDerivedSource(source) || source.dialects.includes("mysql");
+
+const supportedDialects: (mysql: boolean) => readonly SelectDialect[] = (
+  mysql
+) => (mysql ? ["pg", "sqlite", "mysql"] : ["pg", "sqlite"]);
 
 const copySelection = (selection: Selection) =>
-  isTableSource(selection) ? selection : Object.freeze({ ...selection });
+  isSource(selection) ? selection : Object.freeze({ ...selection });
 
 class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   static {
@@ -390,12 +523,103 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     return new Query({ ...this.#state, ...changes });
   }
 
-  from(source: TableSource) {
+  from(input: Scoped<Source>) {
     if (this.#state.source !== undefined) {
       throw new TypeError("SELECT already has a FROM source");
     }
 
-    return this.#copy({ scope: addSource(this.#state.scope, source), source });
+    const source = resolve(input, this.#state.ctes);
+
+    return this.#copy({
+      mysql: this.#state.mysql && supportsMysql(source),
+      scope: addSource(this.#state.scope, source),
+      source,
+    });
+  }
+
+  [QueryTypeId]() {
+    return {
+      ast: this.#ast(),
+      mysql: this.#state.mysql,
+      plan: this.#plan(),
+      selection: this.#selection(),
+    };
+  }
+
+  as(name: string) {
+    return makeDerivedSource(
+      name,
+      this.#plan(),
+      { kind: "subquery", query: this.#ast() },
+      supportedDialects(this.#state.mysql)
+    );
+  }
+
+  scalar(key: string) {
+    const { fields } = this.#plan();
+    const field = Object.hasOwn(fields, key) ? fields[key] : undefined;
+
+    if (field === undefined) {
+      throw new TypeError(`Unknown scalar SELECT field: ${key}`);
+    }
+
+    const alias = "__eqb_scalar";
+
+    const node = {
+      kind: "subquery",
+      query: {
+        from: { relation: { alias, kind: "subquery", query: this.#ast() } },
+        kind: "select",
+        projections: [
+          { expression: { kind: "column", name: field.alias, table: alias } },
+        ],
+      },
+    } satisfies SqlExpression;
+
+    return makeExpression(Schema.NullOr(field.schema), node, []);
+  }
+
+  with(name: string, operand: Scoped<QueryOperand>) {
+    const { ctes, mysql, with: previous } = this.#state;
+    const query = resolve(operand, ctes)[QueryTypeId]();
+
+    const source = makeDerivedSource(
+      name,
+      query.plan,
+      { kind: "cte", name },
+      supportedDialects(query.mysql)
+    );
+
+    return this.#copy({
+      ctes: addSource(ctes, source),
+      mysql: mysql && query.mysql,
+      with: [...previous, { name, query: query.ast }],
+    });
+  }
+
+  #set(operator: SetOperator, query: QueryOperand) {
+    const operand = query[QueryTypeId]();
+
+    return this.#copy({
+      mysql: this.#state.mysql && operand.mysql,
+      sets: [...this.#state.sets, { operand, operator }],
+    });
+  }
+
+  union(query: QueryOperand) {
+    return this.#set("UNION", query);
+  }
+
+  unionAll(query: QueryOperand) {
+    return this.#set("UNION ALL", query);
+  }
+
+  intersect(query: QueryOperand) {
+    return this.#set("INTERSECT", query);
+  }
+
+  except(query: QueryOperand) {
+    return this.#set("EXCEPT", query);
   }
 
   select(selection: Scoped<Selection>) {
@@ -406,14 +630,15 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
   #join(
     kind: Exclude<SelectJoin["kind"], "cross">,
-    source: TableSource,
+    inputSource: Scoped<Source>,
     predicate: Scoped<PredicateInput>
   ) {
     if (this.#state.source === undefined) {
       throw new TypeError("SELECT joins require a FROM source");
     }
 
-    const { joins, mysql, nullable } = this.#state;
+    const { ctes, joins, mysql, nullable } = this.#state;
+    const source = resolve(inputSource, ctes);
     const scope = addSource(this.#state.scope, source);
     const input = resolve(predicate, scope);
     checkInput(input, scope);
@@ -427,35 +652,38 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
     return this.#copy({
       joins: [...joins, { kind, on, source }],
-      mysql: mysql && kind !== "full",
+      mysql: mysql && kind !== "full" && supportsMysql(source),
       nullable: new Set([...nullable, ...leftNulls, ...rightNulls]),
       scope,
     });
   }
 
-  innerJoin(source: TableSource, on: Scoped<PredicateInput>) {
+  innerJoin(source: Scoped<Source>, on: Scoped<PredicateInput>) {
     return this.#join("inner", source, on);
   }
 
-  leftJoin(source: TableSource, on: Scoped<PredicateInput>) {
+  leftJoin(source: Scoped<Source>, on: Scoped<PredicateInput>) {
     return this.#join("left", source, on);
   }
 
-  rightJoin(source: TableSource, on: Scoped<PredicateInput>) {
+  rightJoin(source: Scoped<Source>, on: Scoped<PredicateInput>) {
     return this.#join("right", source, on);
   }
 
-  fullJoin(source: TableSource, on: Scoped<PredicateInput>) {
+  fullJoin(source: Scoped<Source>, on: Scoped<PredicateInput>) {
     return this.#join("full", source, on);
   }
 
-  crossJoin(source: TableSource) {
+  crossJoin(input: Scoped<Source>) {
     if (this.#state.source === undefined) {
       throw new TypeError("SELECT joins require a FROM source");
     }
 
+    const source = resolve(input, this.#state.ctes);
+
     return this.#copy({
       joins: [...this.#state.joins, { kind: "cross", source }],
+      mysql: this.#state.mysql && supportsMysql(source),
       scope: addSource(this.#state.scope, source),
     });
   }
@@ -537,14 +765,20 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     return this;
   }
 
+  #selection() {
+    const selected = this.#state.selection ?? this.#state.source;
+
+    if (selected === undefined) {
+      throw new TypeError("SELECT requires a projection or source");
+    }
+
+    return selected;
+  }
+
   #plan() {
     if (this.#planCache === undefined) {
-      const { groupBy, nullable, scope, selection, source } = this.#state;
-      const selected = selection ?? source;
-
-      if (selected === undefined) {
-        throw new TypeError("SELECT requires a projection or source");
-      }
+      const { groupBy, nullable, scope } = this.#state;
+      const selected = this.#selection();
 
       checkSelection(selected, scope);
       this.#planCache = planProjection(
@@ -567,8 +801,10 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       limit,
       offset,
       orderBy,
+      sets,
       source,
       where,
+      with: ctes,
     } = this.#state;
 
     const plan = this.#plan();
@@ -601,7 +837,19 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       offset,
       orderBy: Arr.isReadonlyArrayNonEmpty(orderBy) ? orderBy : undefined,
       projections: plan.columns,
+      sets: sets.map(({ operand, operator }) => {
+        if (
+          JSON.stringify(plan.layout) !== JSON.stringify(operand.plan.layout)
+        ) {
+          throw new TypeError(
+            "Set operation operands must have the same SQL projection layout"
+          );
+        }
+
+        return { operator, query: operand.ast };
+      }),
       where,
+      with: Arr.isReadonlyArrayNonEmpty(ctes) ? ctes : undefined,
     } satisfies SelectAst;
   }
 
@@ -704,27 +952,44 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 }
 
-export function from<const T extends TableSource>(
+export function from<const T extends Source>(
   source: T
-): SelectQuery<AddSource<EmptyScope, T>, T>;
-export function from(source: TableSource) {
+): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
+export function from(source: Source) {
   const result: object = new Query(empty).from(source);
 
   return result;
 }
 
-export function select<const T extends TableSource>(
+export function select<const T extends Source>(
   selection: T
-): SelectQuery<AddSource<EmptyScope, T>, T>;
-export function select<const P extends Exclude<Selection, TableSource>>(
+): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
+export function select<const P extends Exclude<Selection, Source>>(
   selection: P
 ): SelectQuery<EmptyScope, P>;
 export function select(selection: Selection) {
   const query = new Query(empty);
 
-  const result: object = isTableSource(selection)
+  const result: object = isSource(selection)
     ? query.from(selection)
     : query.select(selection);
+
+  return result;
+}
+
+export function withCte<const Name extends string, Q extends QueryOperand>(
+  name: Name,
+  query: Q
+): SelectQuery<
+  EmptyScope,
+  never,
+  never,
+  OperandDialect<Q>,
+  never,
+  SourceEntry<OperandSource<Name, Q>>
+>;
+export function withCte(name: string, query: QueryOperand) {
+  const result: object = new Query(empty).with(name, query);
 
   return result;
 }

@@ -6,7 +6,7 @@ export { Table } from "./table.ts";
 
 export type { Column, ColumnOptions, TableOptions } from "./table.ts";
 
-export { from } from "./select.ts";
+export { from, withCte } from "./select.ts";
 
 export {
   add,
@@ -46,4 +46,6 @@ export type { SelectQuery } from "./select.ts";
 
 export type { SelectDialect } from "./select-compiler.ts";
 
-export { alias } from "./table.ts";
+export { alias } from "./select-source.ts";
+
+export type { DerivedSource } from "./select-source.ts";

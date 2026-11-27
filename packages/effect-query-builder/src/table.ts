@@ -262,6 +262,28 @@ const validateIdentifier = (identifier: string) => {
   }
 };
 
+export const projectionColumn = (
+  source: string,
+  key: string,
+  name: string,
+  schema: Schema.Constraint
+) => {
+  const storage = inferColumnStorage(schema.ast);
+
+  return Object.freeze<Column>({
+    [ColumnTypeId]: undefined,
+    generated: false,
+    key,
+    name,
+    nullable: storage.nullable,
+    schema,
+    sqlType: storage.sqlType,
+    table: Object.freeze({ name: source }),
+  });
+};
+
+export { validateIdentifier };
+
 const fieldEntries = (fields: Schema.Struct.Fields) => {
   if (
     Object.getOwnPropertySymbols(fields).some(

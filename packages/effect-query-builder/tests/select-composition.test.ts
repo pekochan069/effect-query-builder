@@ -1,0 +1,284 @@
+import { Database } from "bun:sqlite";
+import { expect, expectTypeOf, test } from "bun:test";
+
+import { Effect, Option, Schema, Stream } from "effect";
+import { Reactivity } from "effect/reactivity";
+import { SqlClient, SqlError, Statement } from "effect/sql";
+import type { SqlConnection } from "effect/sql";
+
+import {
+  alias,
+  eq,
+  from,
+  gt,
+  raw,
+  select,
+  Table,
+  withCte,
+} from "../src/index.ts";
+
+const authors = Table.fromSchema(
+  "authors",
+  Schema.Struct({ id: Schema.Int, name: Schema.String })
+);
+
+const books = Table.fromSchema(
+  "books",
+  Schema.Struct({
+    authorId: Schema.Int,
+    note: Schema.OptionFromNullOr(Schema.String),
+  }),
+  { naming: "snake_case" }
+);
+
+const makeClient = (database: Database) => {
+  const execute: SqlConnection.Connection["execute"] = (
+    sql,
+    params,
+    transform
+  ) =>
+    Effect.try({
+      catch: (cause) =>
+        new SqlError.SqlError({ reason: new SqlError.UnknownError({ cause }) }),
+      try: () => {
+        const binds = [
+          ...Schema.decodeUnknownSync(
+            Schema.Array(
+              Schema.Union([Schema.String, Schema.Number, Schema.Null])
+            )
+          )(params),
+        ];
+
+        const rows = database
+          .query<SqlConnection.Row, typeof binds>(sql)
+          .all(...binds);
+
+        return transform === undefined ? rows : transform(rows);
+      },
+    });
+
+  const executeValues: SqlConnection.Connection["executeValues"] = (
+    sql,
+    params
+  ) =>
+    Effect.map(execute(sql, params, undefined), (rows) =>
+      rows.map(Object.values)
+    );
+
+  return Effect.runSync(
+    SqlClient.make({
+      acquirer: Effect.succeed({
+        execute,
+        executeRaw: (sql, params) => execute(sql, params, undefined),
+        executeStream: (sql, params, transform) =>
+          Stream.unwrap(
+            Effect.map(execute(sql, params, transform), Stream.fromIterable)
+          ),
+        executeUnprepared: execute,
+        executeValues,
+        executeValuesUnprepared: executeValues,
+      }),
+      compiler: Statement.makeCompilerSqlite(),
+      driver: "sqlite-bun",
+      spanAttributes: [],
+    }).pipe(Effect.provide(Reactivity.layer))
+  );
+};
+
+const fixture = (db: Database) => {
+  db.run("CREATE TABLE authors (id INTEGER, name TEXT)");
+  db.run("CREATE TABLE books (author_id INTEGER, note TEXT)");
+  db.run("INSERT INTO authors VALUES (1, 'Ada'), (2, 'Lin'), (3, 'Mae')");
+  db.run("INSERT INTO books VALUES (1, NULL), (2, 'reviewed')");
+
+  return makeClient(db);
+};
+
+test("preserves a joined field's presence marker through aliased subqueries", () => {
+  using db = new Database(":memory:");
+
+  const sql = fixture(db);
+
+  const joined = from(authors)
+    .leftJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ author: authors, id: authors.c.id, note: books.c.note })
+    .as("joined");
+
+  const forwarded = from(joined)
+    .select({ id: joined.c.id, note: joined.c.note })
+    .as("forwarded");
+
+  const query = from(forwarded).orderBy(forwarded.c.id);
+
+  expectTypeOf<Effect.Success<typeof query>>().toEqualTypeOf<
+    readonly {
+      readonly id: number;
+      readonly note: Option.Option<string> | null;
+    }[]
+  >();
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([
+    { id: 1, note: Option.none() },
+    { id: 2, note: Option.some("reviewed") },
+    { id: 3, note: null },
+  ]);
+  expect(
+    Effect.runSync(
+      Effect.provideService(
+        from(joined).orderBy(joined.c.id).findOne(),
+        SqlClient.SqlClient,
+        sql
+      )
+    )
+  ).toEqual({ author: { id: 1, name: "Ada" }, id: 1, note: Option.none() });
+});
+
+test("composes CTEs with typed prior references, aliases, and bind order", () => {
+  using db = new Database(":memory:");
+
+  const sql = fixture(db);
+
+  const query = withCte("active", from(authors).where(gt(authors.c.id, 0)))
+    .with("recent", ({ active }) => from(active).where(gt(active.c.id, 1)))
+    .from(({ recent }) => recent)
+    .innerJoin(
+      ({ recent }) => alias(recent, "copy"),
+      ({ recent, copy }) => eq(recent.c.id, copy.c.id)
+    )
+    .where(({ recent }) => eq(recent.c.id, 2))
+    .select(({ recent, copy }) => ({
+      left: recent.c.name,
+      right: copy.c.name,
+    }));
+
+  expectTypeOf<Effect.Success<typeof query>>().toEqualTypeOf<
+    readonly {
+      readonly left: string;
+      readonly right: string;
+    }[]
+  >();
+  expect(query.compile("pg").params).toEqual([0, 1, 2]);
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([{ left: "Lin", right: "Lin" }]);
+});
+
+test("uses a named scalar subquery and decodes an empty scalar as null", () => {
+  using db = new Database(":memory:");
+
+  const sql = fixture(db);
+  const base = from(authors).select({ id: authors.c.id, name: authors.c.name });
+  const first = base.where(eq(authors.c.id, 1)).scalar("name");
+  const missing = base.where(eq(authors.c.id, 0)).scalar("id");
+
+  const query = select({ first, missing });
+
+  expectTypeOf<Effect.Success<typeof query>>().toEqualTypeOf<
+    readonly {
+      readonly first: string | null;
+      readonly missing: number | null;
+    }[]
+  >();
+  expect(query.compile("pg").params).toEqual([1, 0]);
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([{ first: "Ada", missing: null }]);
+});
+
+test("combines set operands by canonical projection order and checks their layouts", () => {
+  using db = new Database(":memory:");
+
+  const sql = fixture(db);
+  const base = from(authors).select({ id: authors.c.id, name: authors.c.name });
+  const first = base.where(eq(authors.c.id, 1));
+
+  const second = from(authors)
+    .select({ name: authors.c.name, id: authors.c.id })
+    .where(eq(authors.c.id, 2));
+
+  const union = first
+    .union(second)
+    .unionAll(first)
+    .intersect(base)
+    .except(second)
+    .as("results");
+
+  const query = from(union).orderBy(union.c.id);
+
+  expectTypeOf<Effect.Success<typeof query>>().toEqualTypeOf<
+    readonly {
+      readonly id: number;
+      readonly name: string;
+    }[]
+  >();
+  expect(query.compile("pg").params).toEqual([1, 2, 1, 2]);
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([{ id: 1, name: "Ada" }]);
+
+  const joined = from(authors)
+    .leftJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ note: books.c.note })
+    .as("joined");
+
+  const inferred = from(joined).select({ note: joined.c.note });
+
+  const incompatible = select({
+    note: raw(Schema.NullOr(Schema.OptionFromNullOr(Schema.String)), sql`NULL`),
+  });
+
+  expect(() => inferred.union(incompatible).compile("sqlite")).toThrow(
+    "Set operation operands must have the same SQL projection layout"
+  );
+});
+
+test("carries restricted dialects through derived sources, joins, CTEs, and sets", () => {
+  const left = from(authors).select({ id: authors.c.id });
+
+  const full = from(authors)
+    .fullJoin(books, eq(authors.c.id, books.c.authorId))
+    .select({ id: authors.c.id });
+
+  const derived = full.as("full");
+  const joined = left.crossJoin(derived);
+  const cte = withCte("full", full).from(({ full: source }) => source);
+  const union = cte.union(full);
+
+  expectTypeOf<Parameters<typeof joined.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
+  expectTypeOf<Parameters<typeof cte.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
+  expectTypeOf<Parameters<typeof union.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
+  expect(joined.compile("sqlite").sql).toContain("FULL OUTER JOIN");
+  expect(union.compile("pg").sql).toContain("FULL OUTER JOIN");
+});
+
+test("rejects set operands whose fields use different shared presence markers", () => {
+  const left = alias(books, "left_books");
+  const right = alias(books, "right_books");
+
+  const joined = from(authors)
+    .leftJoin(left, eq(authors.c.id, left.c.authorId))
+    .leftJoin(right, eq(authors.c.id, right.c.authorId));
+
+  const first = joined.select({
+    a: left.c.note,
+    b: right.c.note,
+    c: left.c.note,
+  });
+
+  const second = joined.select({
+    a: left.c.note,
+    b: right.c.note,
+    c: right.c.note,
+  });
+
+  expect(() => first.unionAll(second).compile("sqlite")).toThrow(
+    "Set operation operands must have the same SQL projection layout"
+  );
+});
