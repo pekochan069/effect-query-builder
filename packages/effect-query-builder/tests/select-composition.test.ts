@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, expectTypeOf, test } from "bun:test";
 
-import { Effect, Option, Schema, Stream } from "effect";
+import { Effect, Option, Result, Schema, Stream } from "effect";
 import { Reactivity } from "effect/reactivity";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
@@ -12,6 +12,7 @@ import {
   eq,
   from,
   gt,
+  neq,
   raw,
   select,
   Table,
@@ -394,3 +395,52 @@ test("rejects set operands whose fields use different shared presence markers", 
     "Set operation operands must have the same SQL projection layout"
   );
 });
+
+test.each(["subquery", "CTE"] as const)(
+  "preserves outer join absence through a derived %s",
+  (kind) => {
+    using db = new Database(":memory:");
+    const sql = fixture(db);
+
+    const inner = from(authors)
+      .leftJoin(books, eq(authors.c.id, books.c.authorId))
+      .where(neq(authors.c.id, 2))
+      .select({
+        id: authors.c.id,
+        bookAuthor: books.c.authorId,
+        note: books.c.note,
+      });
+
+    const query = (
+      kind === "subquery"
+        ? from(authors).leftJoin(inner.as("joined"), ({ joined }) =>
+            eq(authors.c.id, joined.c.id)
+          )
+        : withCte("joined", inner)
+            .from(authors)
+            .leftJoin(
+              ({ joined }) => joined,
+              ({ joined }) => eq(authors.c.id, joined.c.id)
+            )
+    )
+      .select(({ joined }) => ({
+        id: authors.c.id,
+        joinedId: joined.c.id,
+        bookAuthor: joined.c.bookAuthor,
+        note: joined.c.note,
+      }))
+      .orderBy(authors.c.id);
+
+    expect(
+      Effect.runSync(
+        Effect.result(Effect.provideService(query, SqlClient.SqlClient, sql))
+      )
+    ).toEqual(
+      Result.succeed([
+        { id: 1, joinedId: 1, bookAuthor: 1, note: Option.none() },
+        { id: 2, joinedId: null, bookAuthor: null, note: null },
+        { id: 3, joinedId: 3, bookAuthor: null, note: null },
+      ])
+    );
+  }
+);
