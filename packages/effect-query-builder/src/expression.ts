@@ -3,6 +3,7 @@ import type { SchemaAST } from "effect";
 import { Statement } from "effect/sql";
 
 import { inferColumnStorage } from "./column-storage.ts";
+import type { CheckDialect } from "./dialect.ts";
 import type { Expression as ExpressionNode } from "./kernel/ast.ts";
 import type { SqlDialect } from "./kernel/compile.ts";
 import { isColumn } from "./table.ts";
@@ -13,6 +14,7 @@ const OrderingTypeId = Symbol("effect-query-builder/Ordering");
 declare const ExpressionDialectTypeId: unique symbol;
 declare const ExpressionSqlValueTypeId: unique symbol;
 declare const ProjectedSqlValueTypeId: unique symbol;
+declare const UnknownSqlValue: unique symbol;
 
 export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
@@ -54,9 +56,11 @@ export type ExpressionReferences<Input> =
     : InputReferences<Input>;
 
 type ExcludedDialects<Input> =
-  Input extends Expression<Schema.Constraint, Column, infer Dialect>
-    ? Exclude<SqlDialect, Dialect>
-    : never;
+  Input extends Ordering<infer Item>
+    ? ExcludedDialects<Item>
+    : Input extends Expression<Schema.Constraint, Column, infer Dialect>
+      ? Exclude<SqlDialect, Dialect>
+      : never;
 
 export type ExpressionDialect<Input> = Exclude<
   SqlDialect,
@@ -82,12 +86,18 @@ export interface ProjectedSqlValue<Value> {
   readonly [ProjectedSqlValueTypeId]: Value;
 }
 
+type EncodedSqlValue<S extends Schema.Constraint> = unknown extends S["Encoded"]
+  ? typeof UnknownSqlValue
+  : S["Encoded"];
+
 export type SqlValue<Input> = Input extends Column
   ? Input["schema"]["Encoded"]
   : Input extends Expression<infer S, Column, SqlDialect, infer Value>
-    ? unknown extends Value
-      ? S["Type"]
-      : Value
+    ? Value extends typeof UnknownSqlValue
+      ? unknown
+      : unknown extends Value
+        ? S["Type"]
+        : Value
     : Input extends Statement.Fragment
       ? unknown
       : Input;
@@ -300,6 +310,7 @@ const composeExpression = <
   S extends Schema.Constraint,
   Operands extends readonly (Operand | Statement.Fragment)[],
   Value = S["Type"],
+  D extends SqlDialect = SqlDialect,
 >(
   schema: S,
   node: Node,
@@ -308,7 +319,7 @@ const composeExpression = <
   makeExpression<
     S,
     InputReferences<Operands[number]>,
-    ExpressionDialect<Operands[number]>,
+    D & ExpressionDialect<Operands[number]>,
     Value
   >(schema, node, referencesOf(operands));
 
@@ -325,6 +336,7 @@ const mayBeNull = (operand: Operand | Statement.Fragment) => {
 function nullPropagating<
   S extends Schema.Constraint,
   Operands extends readonly (Operand | Statement.Fragment)[],
+  D extends SqlDialect = SqlDialect,
 >(
   schema: S,
   node: Node,
@@ -332,7 +344,7 @@ function nullPropagating<
 ): Expression<
   NullableSchema<S, Operands[number]>,
   InputReferences<Operands[number]>,
-  ExpressionDialect<Operands[number]>
+  D & ExpressionDialect<Operands[number]>
 >;
 function nullPropagating(
   schema: Schema.Constraint,
@@ -358,7 +370,9 @@ const comparison =
   (operator: Operator) =>
   <L extends ScalarExpression, R extends Operand>(
     left: L,
-    right: R & Matches<R, NonNullable<SqlValue<NoInfer<L>>>>
+    right: R &
+      Matches<R, NonNullable<SqlValue<NoInfer<L>>>> &
+      CheckDialect<ExpressionDialect<NoInfer<L> | NoInfer<R>>>
   ) =>
     nullPropagating(booleanSchema, binary(operator, left, right), [
       left,
@@ -374,7 +388,9 @@ export const lte = comparison("<=");
 
 const logical =
   (operator: "AND" | "OR") =>
-  <const Terms extends readonly PredicateInput[]>(...terms: Terms) => {
+  <const Terms extends readonly PredicateInput[]>(
+    ...terms: Terms & CheckDialect<ExpressionDialect<NoInfer<Terms>[number]>>
+  ) => {
     const [first, ...rest] = terms;
 
     let node: Node =
@@ -416,14 +432,121 @@ const nullCheck =
 export const isNull = nullCheck(false);
 export const isNotNull = nullCheck(true);
 
-export const like = <L extends ScalarExpression, R extends Operand>(
-  left: L & Matches<L, string>,
-  pattern: R & Matches<R, string>
+const matchPattern =
+  <D extends SqlDialect>(operator: "LIKE" | "ILIKE") =>
+  <L extends ScalarExpression, R extends Operand>(
+    left: L & Matches<L, string>,
+    pattern: R &
+      Matches<R, string> &
+      CheckDialect<D & ExpressionDialect<NoInfer<L> | NoInfer<R>>>
+  ) =>
+    nullPropagating<typeof booleanSchema, readonly [L, R], D>(
+      booleanSchema,
+      binary(operator, left, pattern),
+      [left, pattern]
+    );
+
+export const like = matchPattern<SqlDialect>("LIKE");
+export const ilike = matchPattern<"pg">("ILIKE");
+
+export const jsonbGet = <
+  Input extends ScalarExpression,
+  S extends Schema.Constraint,
+>(
+  input: Input & CheckDialect<"pg" & ExpressionDialect<NoInfer<Input>>>,
+  key: string,
+  schema: S
+) => {
+  const nullable = sqlNullOr(schema);
+
+  return composeExpression<
+    typeof nullable,
+    readonly [Input],
+    Schema.Json,
+    "pg"
+  >(nullable, binary("->", input, key), [input]);
+};
+
+export const jsonbText = <Input extends ScalarExpression>(
+  input: Input & CheckDialect<"pg" & ExpressionDialect<NoInfer<Input>>>,
+  key: string
+) => {
+  const schema = sqlNullOr(Schema.String);
+
+  return composeExpression<
+    typeof schema,
+    readonly [Input],
+    string | null,
+    "pg"
+  >(schema, binary("->>", input, key), [input]);
+};
+
+export const jsonbContains = <Input extends ScalarExpression>(
+  input: Input & CheckDialect<"pg" & ExpressionDialect<NoInfer<Input>>>,
+  value: Schema.Json
 ) =>
-  nullPropagating(booleanSchema, binary("LIKE", left, pattern), [
-    left,
-    pattern,
-  ]);
+  nullPropagating<typeof booleanSchema, readonly [Input], "pg">(
+    booleanSchema,
+    binary("@>", input, JSON.stringify(value)),
+    [input]
+  );
+
+export const jsonbHasKey = <Input extends ScalarExpression>(
+  input: Input & CheckDialect<"pg" & ExpressionDialect<NoInfer<Input>>>,
+  key: string
+) =>
+  nullPropagating<typeof booleanSchema, readonly [Input], "pg">(
+    booleanSchema,
+    binary("?", input, key),
+    [input]
+  );
+
+const sqliteJson = <
+  Input extends ScalarExpression,
+  S extends Schema.Constraint,
+>(
+  name: Extract<Node, { kind: "sqliteJson" }>["name"],
+  input: Input,
+  path: string,
+  schema: S
+) => {
+  const nullable = sqlNullOr(schema);
+
+  return composeExpression<
+    typeof nullable,
+    readonly [Input],
+    EncodedSqlValue<typeof nullable>,
+    "sqlite"
+  >(
+    nullable,
+    {
+      kind: "sqliteJson",
+      name,
+      operand: toExpressionNode(input),
+      path: toOperandNode(path),
+    },
+    [input]
+  );
+};
+
+export const jsonExtract = <
+  Input extends ScalarExpression,
+  S extends Schema.Constraint,
+>(
+  input: Input & CheckDialect<"sqlite" & ExpressionDialect<NoInfer<Input>>>,
+  path: string,
+  schema: S
+) => sqliteJson("json_extract", input, path, schema);
+
+export const jsonType = <Input extends ScalarExpression>(
+  input: Input & CheckDialect<"sqlite" & ExpressionDialect<NoInfer<Input>>>,
+  path = "$"
+) => sqliteJson("json_type", input, path, Schema.String);
+
+export const jsonArrayLength = <Input extends ScalarExpression>(
+  input: Input & CheckDialect<"sqlite" & ExpressionDialect<NoInfer<Input>>>,
+  path = "$"
+) => sqliteJson("json_array_length", input, path, Schema.Int);
 
 export const between = <
   Input extends ScalarExpression,
@@ -604,7 +727,12 @@ export const max = extremum("MAX");
 export const raw = <S extends Schema.Constraint>(
   schema: S,
   fragment: Statement.Fragment
-) => makeExpression(schema, toExpressionNode(fragment), []);
+) =>
+  makeExpression<S, never, SqlDialect, EncodedSqlValue<S>>(
+    schema,
+    toExpressionNode(fragment),
+    []
+  );
 
 const ordering =
   (direction: Ordering["direction"]) =>

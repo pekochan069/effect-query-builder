@@ -151,7 +151,7 @@ type WriteFields<
       : Fields[Key];
 };
 
-type RowSchema = Schema.Constraint & {
+export type RowSchema = Schema.Constraint & {
   readonly Encoded: object;
   readonly fields: Schema.Struct.Fields;
 };
@@ -162,7 +162,9 @@ export interface TableSource {
   readonly c: Readonly<Record<string, Column>>;
   readonly identifier: QualifiedName;
   readonly name: string;
+  readonly insert: RowSchema;
   readonly select: RowSchema;
+  readonly update: RowSchema;
   readonly decodeRow: (
     row: SqlConnection.Row
   ) => Effect.Effect<unknown, Schema.SchemaError, unknown>;
@@ -189,7 +191,9 @@ interface AliasedTable<
   readonly alias: Alias;
   readonly name: Alias;
   readonly c: AliasedColumns<Source, Alias>;
+  readonly insert: Source["insert"];
   readonly select: Source["select"];
+  readonly update: Source["update"];
   readonly decodeRow: Source["decodeRow"];
 }
 
@@ -214,8 +218,10 @@ export function alias(source: TableSource, name: string) {
     c: Object.freeze(c),
     decodeRow: source.decodeRow,
     identifier: source.identifier,
+    insert: source.insert,
     name,
     select: source.select,
+    update: source.update,
   });
 }
 

@@ -1,3 +1,5 @@
+export type { Dialect } from "./dialect.ts";
+
 export type { ColumnNaming } from "./column-names.ts";
 
 export type { SqlTypes } from "./column-storage.ts";
@@ -49,3 +51,9 @@ export type { SqlDialect as SelectDialect } from "./kernel/compile.ts";
 export { alias } from "./select-source.ts";
 
 export type { DerivedSource } from "./select-source.ts";
+
+export { deleteFrom, insertInto, update } from "./write.ts";
+
+export type { DeleteQuery, InsertQuery, UpdateQuery } from "./write.ts";
+
+export { WriteInputError } from "./write-values.ts";

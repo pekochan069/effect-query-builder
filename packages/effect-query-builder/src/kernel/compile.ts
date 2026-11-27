@@ -1,11 +1,16 @@
 import type {
+  DeleteStatement,
   Expression,
+  InsertConflict,
+  InsertStatement,
   Join,
   Projection,
   QualifiedName,
   Relation,
   SelectStatement,
   Statement,
+  UpdateStatement,
+  WriteAssignment,
 } from "./ast.ts";
 import { UnsupportedDialectClauseError } from "./errors.ts";
 import {
@@ -20,8 +25,8 @@ export type SqlDialect = "pg" | "sqlite" | "mysql";
 
 type DialectProfile = SqlDialect | "portable" | "mariadb";
 
-type WriteStatement = Extract<
-  Statement,
+type WriteStatement<Raw = never> = Extract<
+  Statement<Raw>,
   { kind: "insert" | "update" | "delete" }
 >;
 
@@ -32,6 +37,10 @@ type CompilerToken<Raw> =
   | { readonly kind: "identifier"; readonly name: string }
   | { readonly kind: "raw"; readonly value: Raw };
 
+type ColumnQualifier =
+  | { readonly kind: "unqualified" }
+  | { readonly kind: "replace"; readonly from: string; readonly to: string };
+
 const joinSql = {
   cross: "CROSS JOIN",
   full: "FULL OUTER JOIN",
@@ -39,6 +48,10 @@ const joinSql = {
   left: "LEFT JOIN",
   right: "RIGHT JOIN",
 } satisfies Record<Join["kind"], string>;
+
+const pgOperators = new Set<
+  Extract<Expression, { kind: "binary" }>["operator"]
+>(["ILIKE", "->", "->>", "@>", "?"]);
 
 const offsetOnlyLimit = {
   pg: "",
@@ -56,6 +69,8 @@ class Compiler<Raw> {
   readonly #dialect: SqlDialect | undefined;
   readonly #profile: DialectProfile | undefined;
   readonly #write: (token: CompilerToken<Raw>) => void;
+  #qualifier?: ColumnQualifier;
+  #updatingConflict?: "doUpdate" | "duplicateKeyUpdate";
 
   constructor(
     target: CompileTarget | undefined,
@@ -225,13 +240,49 @@ class Compiler<Raw> {
     this.#text(String(value));
   }
 
+  #booleanLiteral(value: boolean) {
+    if (this.#dialect === "sqlite") {
+      this.#text(value ? "1" : "0");
+    } else {
+      this.#text(value ? "TRUE" : "FALSE");
+    }
+  }
+
+  #binary(expression: Extract<Expression<Raw>, { kind: "binary" }>) {
+    if (pgOperators.has(expression.operator)) {
+      this.#requireDialect(expression.operator, "pg");
+    }
+
+    this.#text("(");
+    this.#expression(expression.left);
+    this.#text(` ${expression.operator} `);
+    this.#expression(expression.right);
+    this.#text(")");
+  }
+
+  #column(expression: Extract<Expression<Raw>, { kind: "column" }>) {
+    const qualifier = this.#qualifier;
+    let schema = expression.table;
+
+    if (qualifier?.kind === "unqualified") {
+      schema = undefined;
+    } else if (qualifier?.kind === "replace" && schema === qualifier.from) {
+      schema = qualifier.to;
+    }
+
+    this.#qualifiedName({ name: expression.name, schema });
+  }
+
   #expression(expression: Expression<Raw>) {
     switch (expression.kind) {
       case "column": {
-        this.#qualifiedName({
-          name: expression.name,
-          schema: expression.table,
-        });
+        this.#column(expression);
+
+        return;
+      }
+
+      case "incomingColumn": {
+        this.#incomingColumn(expression.name);
 
         return;
       }
@@ -255,11 +306,7 @@ class Compiler<Raw> {
       }
 
       case "booleanLiteral": {
-        if (this.#dialect === "sqlite") {
-          this.#text(expression.value ? "1" : "0");
-        } else {
-          this.#text(expression.value ? "TRUE" : "FALSE");
-        }
+        this.#booleanLiteral(expression.value);
 
         return;
       }
@@ -270,11 +317,25 @@ class Compiler<Raw> {
         return;
       }
 
+      case "defaultValue": {
+        this.#requireDialect("DEFAULT in VALUES", "pg", "mysql");
+        this.#text("DEFAULT");
+
+        return;
+      }
+
       case "binary": {
-        this.#text("(");
-        this.#expression(expression.left);
-        this.#text(` ${expression.operator} `);
-        this.#expression(expression.right);
+        this.#binary(expression);
+
+        return;
+      }
+
+      case "sqliteJson": {
+        this.#requireDialect(expression.name, "sqlite");
+        this.#text(`${expression.name}(`);
+        this.#expression(expression.operand);
+        this.#text(", ");
+        this.#expression(expression.path);
         this.#text(")");
 
         return;
@@ -469,8 +530,30 @@ class Compiler<Raw> {
     this.#identifier(alias);
   }
 
+  #requireDialect(sql: string, ...dialects: readonly SqlDialect[]) {
+    const dialect = this.#dialect;
+
+    if (dialect === undefined) {
+      throw new UnsupportedDialectClauseError(
+        `Use toFragment(dialect) for ${sql}`
+      );
+    }
+
+    if (this.#profile === "portable" || !dialects.includes(dialect)) {
+      throw new UnsupportedDialectClauseError(
+        `${sql} is unsupported by the ${this.#profile} dialect profile`
+      );
+    }
+  }
+
   #requireClause(clause: ConditionalClause, sql: string) {
-    if (this.#profile !== undefined && !supportsClause(this.#profile, clause)) {
+    if (this.#profile === undefined) {
+      throw new UnsupportedDialectClauseError(
+        `Use toFragment(dialect) for ${sql}`
+      );
+    }
+
+    if (!supportsClause(this.#profile, clause)) {
       throw new UnsupportedDialectClauseError(
         `${sql} is unsupported by the ${this.#profile} dialect profile`
       );
@@ -494,9 +577,30 @@ class Compiler<Raw> {
   }
 
   #subquery(query: SelectStatement<Raw>) {
+    const updatingConflict = this.#updatingConflict;
+    this.#updatingConflict = undefined;
     this.#text("(");
-    this.#select(query);
+
+    try {
+      this.#withQualifier(undefined, () => {
+        this.#select(query);
+      });
+    } finally {
+      this.#updatingConflict = updatingConflict;
+    }
+
     this.#text(")");
+  }
+
+  #withQualifier(qualifier: ColumnQualifier | undefined, render: () => void) {
+    const current = this.#qualifier;
+    this.#qualifier = qualifier;
+
+    try {
+      render();
+    } finally {
+      this.#qualifier = current;
+    }
   }
 
   #predicate(
@@ -536,6 +640,10 @@ class Compiler<Raw> {
   }
 
   #select(query: SelectStatement<Raw>) {
+    if (query.dialect !== undefined) {
+      this.#requireDialect(`SELECT scoped to ${query.dialect}`, query.dialect);
+    }
+
     if (query.with !== undefined) {
       this.#text("WITH ");
       this.#list(query.with, (cte) => {
@@ -564,7 +672,21 @@ class Compiler<Raw> {
   }
 
   #selectBody(query: SelectStatement<Raw>) {
-    this.#text(query.distinct === true ? "SELECT DISTINCT " : "SELECT ");
+    const { distinct } = query;
+
+    this.#text("SELECT ");
+
+    if (distinct === true) {
+      this.#text("DISTINCT ");
+    } else if (distinct !== undefined && distinct !== false) {
+      this.#requireDialect("DISTINCT ON", "pg");
+      this.#text("DISTINCT ON (");
+      this.#list(distinct, (expression) => {
+        this.#groupOrOrderExpression(expression);
+      });
+      this.#text(") ");
+    }
+
     this.#projections(query.projections, query.orderBy);
 
     if (query.from !== undefined) {
@@ -606,56 +728,263 @@ class Compiler<Raw> {
     if (offset !== undefined) {
       this.#limitValue("OFFSET", offset);
     }
-  }
 
-  #returning(statement: WriteStatement) {
-    if (statement.returning !== undefined) {
-      this.#requireClause(`${statement.kind}Returning`, "RETURNING");
-      this.#text(" RETURNING ");
-      this.#projections(statement.returning);
+    if (query.forUpdate === true) {
+      this.#requireDialect("FOR UPDATE", "pg", "mysql");
+
+      if (
+        this.#dialect === "pg" &&
+        ((distinct !== undefined && distinct !== false) ||
+          query.groupBy !== undefined ||
+          query.having !== undefined)
+      ) {
+        throw new UnsupportedDialectClauseError(
+          "PostgreSQL FOR UPDATE requires a SELECT without DISTINCT, GROUP BY, or HAVING"
+        );
+      }
+
+      this.#text(" FOR UPDATE");
     }
   }
 
-  #insert(statement: Extract<WriteStatement, { kind: "insert" }>) {
+  #returning(statement: WriteStatement<Raw>) {
+    const { returning } = statement;
+
+    if (returning !== undefined) {
+      this.#requireClause(`${statement.kind}Returning`, "RETURNING");
+      this.#text(" RETURNING ");
+
+      if (this.#dialect === "sqlite") {
+        this.#withQualifier({ kind: "unqualified" }, () => {
+          this.#projections(returning);
+        });
+      } else {
+        this.#projections(returning);
+      }
+    }
+  }
+
+  #insert(statement: InsertStatement<Raw>) {
     this.#text("INSERT INTO ");
     this.#qualifiedName(statement.table);
+
+    const { conflict, table } = statement;
+
+    const targetName =
+      this.#dialect === "sqlite" ? table.name.toLowerCase() : table.name;
+
+    const qualify = conflict?.kind === "doUpdate" && targetName === "excluded";
+    const targetAlias = "__eqb_insert_target";
+
+    if (qualify) {
+      this.#alias(targetAlias);
+    }
+
+    this.#insertSource(statement);
+
+    this.#withQualifier(
+      qualify
+        ? { kind: "replace", from: table.name, to: targetAlias }
+        : undefined,
+      () => {
+        if (conflict !== undefined) {
+          this.#conflict(conflict);
+        }
+
+        this.#returning(statement);
+      }
+    );
+  }
+
+  #incomingColumn(name: string) {
+    if (this.#updatingConflict === "doUpdate") {
+      this.#qualifiedName({ name, schema: "excluded" });
+    } else if (this.#updatingConflict === "duplicateKeyUpdate") {
+      this.#text("VALUES(");
+      this.#identifier(name);
+      this.#text(")");
+    } else {
+      throw new UnsupportedDialectClauseError(
+        "Incoming columns require an upsert assignment"
+      );
+    }
+  }
+
+  #conflict(conflict: InsertConflict<Raw>) {
+    if (conflict.kind === "duplicateKeyUpdate") {
+      this.#requireDialect("ON DUPLICATE KEY UPDATE", "mysql");
+      this.#text(" ON DUPLICATE KEY UPDATE ");
+    } else {
+      this.#requireDialect("ON CONFLICT", "pg", "sqlite");
+      this.#text(" ON CONFLICT");
+
+      if (conflict.columns !== undefined) {
+        this.#text(" (");
+        this.#list(conflict.columns, (column) => {
+          this.#identifier(column);
+        });
+        this.#text(")");
+      }
+
+      if (conflict.kind === "doNothing") {
+        this.#text(" DO NOTHING");
+
+        return;
+      }
+
+      this.#text(" DO UPDATE SET ");
+    }
+
+    this.#updatingConflict = conflict.kind;
+
+    try {
+      this.#assignments(conflict.assignments);
+    } finally {
+      this.#updatingConflict = undefined;
+    }
+  }
+
+  #insertSource(statement: InsertStatement<Raw>) {
+    if ("defaultRows" in statement) {
+      if (statement.conflict !== undefined) {
+        this.#requireDialect("Upsert with default-only INSERT", "pg", "mysql");
+      }
+
+      this.#defaultInsert(statement.defaultRows, statement.defaultColumn);
+
+      return;
+    }
+
     this.#text(" (");
     this.#list(statement.columns, (column) => {
       this.#identifier(column);
     });
-    this.#text(") VALUES ");
-    this.#list(statement.rows, (row) => {
-      if (row.length !== statement.columns.length) {
-        throw new TypeError("Each INSERT row must match the column count");
-      }
+    this.#text(") ");
 
-      this.#text("(");
-      this.#list(row, (value) => {
-        this.#expression(value);
+    if ("select" in statement) {
+      this.#insertSelect(statement);
+    } else {
+      this.#text("VALUES ");
+      this.#list(statement.rows, (row) => {
+        if (row.length !== statement.columns.length) {
+          throw new TypeError("Each INSERT row must match the column count");
+        }
+
+        this.#text("(");
+        this.#list(row, (value) => {
+          this.#expression(value);
+        });
+        this.#text(")");
       });
-      this.#text(")");
-    });
-    this.#returning(statement);
+    }
   }
 
-  #update(statement: Extract<WriteStatement, { kind: "update" }>) {
-    this.#text("UPDATE ");
-    this.#qualifiedName(statement.table);
-    this.#text(" SET ");
-    this.#list(statement.assignments, ({ column, value }) => {
+  #insertSelect(
+    statement: Extract<InsertStatement<Raw>, { readonly select: unknown }>
+  ) {
+    const { conflict, select, table } = statement;
+    const dialect = this.#dialect;
+
+    if (
+      conflict === undefined ||
+      (dialect !== "sqlite" && dialect !== "mysql")
+    ) {
+      this.#select(select);
+
+      return;
+    }
+
+    if (dialect === "sqlite" && (select.sets?.length ?? 0) === 0) {
+      this.#select({
+        ...select,
+        where: select.where ?? { kind: "booleanLiteral", value: true },
+      });
+
+      return;
+    }
+
+    const alias = "__eqb_upsert_source";
+
+    this.#text("SELECT * FROM ");
+    this.#subquery(select);
+    this.#alias(table.name.toLowerCase() === alias ? `${alias}_1` : alias);
+
+    if (dialect === "sqlite") {
+      this.#text(" WHERE 1");
+    }
+  }
+
+  #defaultInsert(count: number, column: string | undefined) {
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw new TypeError("INSERT requires at least one row");
+    }
+
+    if (this.#dialect === "mysql") {
+      this.#text(` () VALUES ()${", ()".repeat(count - 1)}`);
+    } else if (count === 1) {
+      this.#text(" DEFAULT VALUES");
+    } else {
+      this.#requireDialect("Bulk default-only INSERT", "pg");
+
+      if (column === undefined) {
+        throw new TypeError(
+          "Bulk default-only INSERT requires a target column"
+        );
+      }
+
+      this.#text(" (");
+      this.#identifier(column);
+      this.#text(`) VALUES (DEFAULT)${", (DEFAULT)".repeat(count - 1)}`);
+    }
+  }
+
+  #assignments(assignments: readonly WriteAssignment<Raw>[]) {
+    this.#list(assignments, ({ column, value }) => {
       this.#identifier(column);
       this.#text(" = ");
       this.#expression(value);
     });
+  }
+
+  #update(statement: UpdateStatement<Raw>) {
+    this.#text("UPDATE ");
+    this.#qualifiedName(statement.table);
+
+    if (statement.alias !== undefined) {
+      this.#alias(statement.alias);
+    }
+
+    this.#text(" SET ");
+    this.#assignments(statement.assignments);
     this.#predicate("WHERE", statement.where);
     this.#returning(statement);
   }
 
-  #delete(statement: Extract<WriteStatement, { kind: "delete" }>) {
-    this.#text("DELETE FROM ");
-    this.#qualifiedName(statement.table);
-    this.#predicate("WHERE", statement.where);
-    this.#returning(statement);
+  #delete(statement: DeleteStatement<Raw>) {
+    const { alias, table } = statement;
+    const lowerAlias = alias !== undefined && this.#profile === "mariadb";
+
+    this.#text("DELETE ");
+
+    if (alias !== undefined && this.#dialect === "mysql" && !lowerAlias) {
+      this.#identifier(alias);
+      this.#text(" ");
+    }
+
+    this.#text("FROM ");
+    this.#qualifiedName(table);
+
+    if (alias !== undefined && !lowerAlias) {
+      this.#alias(alias);
+    }
+
+    this.#withQualifier(
+      lowerAlias ? { kind: "replace", from: alias, to: table.name } : undefined,
+      () => {
+        this.#predicate("WHERE", statement.where);
+        this.#returning(statement);
+      }
+    );
   }
 
   #createTable(statement: Extract<Statement, { kind: "createTable" }>) {
@@ -694,9 +1023,9 @@ export const compile = (target: CompileTarget, statement: Statement) => {
   return renderTokens(tokens, compiler.dialect === "pg");
 };
 
-export const renderSelect = <Raw>(
-  dialect: SqlDialect | undefined,
-  query: SelectStatement<Raw>,
+export const renderStatement = <Raw>(
+  dialect: CompileTarget | undefined,
+  query: Statement<Raw>,
   write: (token: CompilerToken<Raw>) => void
 ) => {
   new Compiler(dialect, write).compile(query);

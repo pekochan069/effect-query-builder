@@ -18,6 +18,11 @@ type BinaryOperator =
   | "/"
   | "AND"
   | "LIKE"
+  | "ILIKE"
+  | "->"
+  | "->>"
+  | "@>"
+  | "?"
   | "OR";
 
 export type Expression<Raw = never> =
@@ -43,6 +48,8 @@ export type Expression<Raw = never> =
       readonly value: boolean;
     }
   | { readonly kind: "nullLiteral" }
+  | { readonly kind: "defaultValue" }
+  | { readonly kind: "incomingColumn"; readonly name: string }
   | {
       readonly kind: "binary";
       readonly operator: BinaryOperator;
@@ -80,6 +87,12 @@ export type Expression<Raw = never> =
       readonly kind: "caseWhen";
       readonly condition: Expression<Raw>;
       readonly result: Expression<Raw>;
+    }
+  | {
+      readonly kind: "sqliteJson";
+      readonly name: "json_extract" | "json_type" | "json_array_length";
+      readonly operand: Expression<Raw>;
+      readonly path: Expression<Raw>;
     }
   | {
       readonly kind: "raw";
@@ -133,7 +146,9 @@ interface OrderBy<Raw> {
 export interface SelectStatement<Raw = never> {
   readonly kind: "select";
   readonly with?: NonEmpty<CommonTableExpression<Raw>>;
-  readonly distinct?: boolean;
+  readonly dialect?: "pg" | "sqlite" | "mysql";
+  readonly distinct?: boolean | NonEmpty<Expression<Raw>>;
+  readonly forUpdate?: boolean;
   readonly projections: NonEmpty<Projection<Raw>>;
   readonly from?: {
     readonly relation: Relation<Raw>;
@@ -151,30 +166,54 @@ export interface SelectStatement<Raw = never> {
   }[];
 }
 
-interface InsertStatement {
+interface WriteTarget<Raw> {
+  readonly table: QualifiedName;
+  readonly returning?: NonEmpty<Projection<Raw>>;
+}
+
+export type InsertStatement<Raw = never> = WriteTarget<Raw> & {
   readonly kind: "insert";
-  readonly table: QualifiedName;
-  readonly columns: NonEmpty<string>;
-  readonly rows: NonEmpty<NonEmpty<Expression>>;
-  readonly returning?: NonEmpty<Projection>;
+  readonly conflict?: InsertConflict<Raw>;
+} & (
+    | {
+        readonly columns: NonEmpty<string>;
+        readonly rows: NonEmpty<NonEmpty<Expression<Raw>>>;
+      }
+    | {
+        readonly columns: NonEmpty<string>;
+        readonly select: SelectStatement<Raw>;
+      }
+    | { readonly defaultRows: number; readonly defaultColumn?: string }
+  );
+
+export type InsertConflict<Raw = never> =
+  | { readonly kind: "doNothing"; readonly columns?: NonEmpty<string> }
+  | {
+      readonly kind: "doUpdate";
+      readonly columns: NonEmpty<string>;
+      readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+    }
+  | {
+      readonly kind: "duplicateKeyUpdate";
+      readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+    };
+
+export interface WriteAssignment<Raw = never> {
+  readonly column: string;
+  readonly value: Expression<Raw>;
 }
 
-interface UpdateStatement {
+export interface UpdateStatement<Raw = never> extends WriteTarget<Raw> {
   readonly kind: "update";
-  readonly table: QualifiedName;
-  readonly assignments: NonEmpty<{
-    readonly column: string;
-    readonly value: Expression;
-  }>;
-  readonly where?: Expression;
-  readonly returning?: NonEmpty<Projection>;
+  readonly alias?: string;
+  readonly assignments: NonEmpty<WriteAssignment<Raw>>;
+  readonly where?: Expression<Raw>;
 }
 
-interface DeleteStatement {
+export interface DeleteStatement<Raw = never> extends WriteTarget<Raw> {
   readonly kind: "delete";
-  readonly table: QualifiedName;
-  readonly where?: Expression;
-  readonly returning?: NonEmpty<Projection>;
+  readonly alias?: string;
+  readonly where?: Expression<Raw>;
 }
 
 interface CreateTableStatement {
@@ -196,8 +235,8 @@ interface DropTableStatement {
 
 export type Statement<Raw = never> =
   | SelectStatement<Raw>
-  | InsertStatement
-  | UpdateStatement
-  | DeleteStatement
+  | InsertStatement<Raw>
+  | UpdateStatement<Raw>
+  | DeleteStatement<Raw>
   | CreateTableStatement
   | DropTableStatement;

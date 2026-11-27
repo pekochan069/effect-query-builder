@@ -473,7 +473,9 @@ test("rejects an unsupported scalar in a predicate with a typed SQL error", () =
   const authorsQuery = from(authors);
   const filtered = authorsQuery.where(eq(authors.c.id, id));
 
-  expectTypeOf<typeof filtered>().toEqualTypeOf<typeof authorsQuery>();
+  expectTypeOf<Parameters<typeof filtered.compile>[0]>().toEqualTypeOf<
+    "pg" | "sqlite"
+  >();
 
   const result = Effect.runSync(
     Effect.flip(Effect.provideService(filtered, SqlClient.SqlClient, client))

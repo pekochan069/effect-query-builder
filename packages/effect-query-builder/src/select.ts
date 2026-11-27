@@ -9,9 +9,11 @@ import {
 import type { Option, Types, Schema } from "effect";
 import { flatMap, forEach, map } from "effect/Effect";
 import { identity } from "effect/Function";
-import { SqlClient, SqlError, Statement } from "effect/sql";
-import type { SqlConnection } from "effect/sql";
+import { SqlClient, Statement } from "effect/sql";
+import type { SqlConnection, SqlError } from "effect/sql";
 
+import { getClientDialect, unsupportedDialect } from "./dialect.ts";
+import type { CheckDialect } from "./dialect.ts";
 import {
   isExpression,
   isOrdering,
@@ -130,9 +132,41 @@ type CheckFrom<P extends Selection, T extends Source> = [P] extends [never]
   ? unknown
   : CheckSelection<P, SourceEntry<T>>;
 
-type SelectionDialect<P extends Selection> = P extends Source
-  ? SourceDialect<P>
-  : ExpressionDialect<P[keyof P]>;
+type ExcludedSelectionItemDialects<Item> = Item extends Source
+  ? Exclude<SqlDialect, SourceDialect<Item>>
+  : Exclude<SqlDialect, ExpressionDialect<Item>>;
+
+type ExcludedSelectionDialects<P> = P extends Selection
+  ? P extends Source
+    ? ExcludedSelectionItemDialects<P>
+    : ExcludedSelectionItemDialects<P[keyof P]>
+  : never;
+
+type SelectionDialect<P extends Selection> = Exclude<
+  SqlDialect,
+  ExcludedSelectionDialects<P>
+>;
+
+type CheckExpression<Input, S extends Scope, D extends SqlDialect> = CheckInput<
+  Input,
+  S
+> &
+  CheckDialect<D & NoInfer<ExpressionDialect<Input>>>;
+
+type CheckSource<T extends Source, D extends SqlDialect> = CheckDialect<
+  D & NoInfer<SourceDialect<T>>
+>;
+
+type CheckJoin<
+  On,
+  S extends Scope,
+  T extends Source,
+  D extends SqlDialect,
+> = CheckExpression<
+  On,
+  S & SourceEntry<NoInfer<T>>,
+  D & NoInfer<SourceDialect<T>>
+>;
 
 type NewSource<S extends Scope, T extends Source> = T &
   (keyof S extends never ? never : T["name"] extends keyof S ? never : unknown);
@@ -147,7 +181,7 @@ type Narrow<Row, Subset> = {
   readonly [K in keyof Row]: K extends keyof Subset ? Subset[K] : Row[K];
 };
 
-const QueryTypeId = Symbol("effect-query-builder/SelectQuery");
+export const QueryTypeId = Symbol("effect-query-builder/SelectQuery");
 
 interface QuerySnapshot<P extends Selection = Selection> {
   readonly plan: ProjectionPlan;
@@ -155,7 +189,7 @@ interface QuerySnapshot<P extends Selection = Selection> {
   readonly selection: P;
 }
 
-interface QueryOperand extends Effect.Effect<
+export interface QueryOperand extends Effect.Effect<
   readonly unknown[],
   SelectError,
   unknown
@@ -166,7 +200,18 @@ interface QueryOperand extends Effect.Effect<
 
 type OperandRow<Q extends QueryOperand> = Effect.Success<Q>[number];
 
-type OperandDialect<Q extends QueryOperand> = Parameters<Q["compile"]>[0];
+type ExcludedOperandDialects<Q> = Q extends QueryOperand
+  ? Exclude<SqlDialect, Parameters<Q["compile"]>[0]>
+  : never;
+
+export type OperandDialect<Q extends QueryOperand> = Exclude<
+  SqlDialect,
+  ExcludedOperandDialects<Q>
+>;
+
+type CheckOperand<Q extends QueryOperand, D extends SqlDialect> = CheckDialect<
+  D & NoInfer<OperandDialect<Q>>
+>;
 
 type OperandSource<
   Name extends string,
@@ -230,7 +275,7 @@ interface SelectResult<
   >;
   readonly with: <const Name extends string, Q extends QueryOperand>(
     name: Name & (Name extends keyof C ? never : unknown),
-    query: Scoped<Q, C>
+    query: Scoped<Q & CheckOperand<Q, D & SelectionDialect<P>>, C>
   ) => SelectBuilder<
     S,
     P,
@@ -241,16 +286,20 @@ interface SelectResult<
     Compound
   >;
   readonly union: <Q extends QueryOperand>(
-    query: SetOperand<Q, Result<P, N, Override>>
+    query: SetOperand<Q, Result<P, N, Override>> &
+      CheckOperand<Q, D & SelectionDialect<P>>
   ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly unionAll: <Q extends QueryOperand>(
-    query: SetOperand<Q, Result<P, N, Override>>
+    query: SetOperand<Q, Result<P, N, Override>> &
+      CheckOperand<Q, D & SelectionDialect<P>>
   ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly intersect: <Q extends QueryOperand>(
-    query: SetOperand<Q, Result<P, N, Override>>
+    query: SetOperand<Q, Result<P, N, Override>> &
+      CheckOperand<Q, D & SelectionDialect<P>>
   ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly except: <Q extends QueryOperand>(
-    query: SetOperand<Q, Result<P, N, Override>>
+    query: SetOperand<Q, Result<P, N, Override>> &
+      CheckOperand<Q, D & SelectionDialect<P>>
   ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly $if: (
     condition: boolean,
@@ -323,7 +372,10 @@ export interface SelectQuery<
 > extends SelectResult<S, P, N, D, Override, C, false> {
   readonly from: <const T extends Source>(
     source: Scoped<
-      T & (keyof S extends never ? unknown : never) & CheckFrom<P, NoInfer<T>>,
+      T &
+        (keyof S extends never ? unknown : never) &
+        CheckFrom<P, NoInfer<T>> &
+        CheckSource<T, D & SelectionDialect<P>>,
       C
     >
   ) => SelectQuery<
@@ -335,91 +387,137 @@ export interface SelectQuery<
     C
   >;
   readonly select: <const Next extends Selection>(
-    selection: Scoped<Next & CheckSelection<Next, S>, S>
+    selection: Scoped<
+      Next &
+        CheckSelection<Next, S> &
+        CheckDialect<D & NoInfer<SelectionDialect<Next>>>,
+      S
+    >
   ) => SelectQuery<S, Next, N, D, never, C>;
   readonly innerJoin: <const T extends Source, const On extends PredicateInput>(
-    source: Scoped<NewSource<S, T>, C>,
+    source: Scoped<
+      NewSource<S, T> & CheckSource<T, D & SelectionDialect<P>>,
+      C
+    >,
     on: Scoped<
-      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      On & CheckJoin<On, S, T, D & SelectionDialect<P>>,
       S & SourceEntry<NoInfer<T>>
     >
-  ) => SelectQuery<S & SourceEntry<T>, P, N, D & SourceDialect<T>, Override, C>;
+  ) => SelectQuery<
+    S & SourceEntry<T>,
+    P,
+    N,
+    D & SourceDialect<T> & ExpressionDialect<On>,
+    Override,
+    C
+  >;
   readonly leftJoin: <const T extends Source, const On extends PredicateInput>(
-    source: Scoped<NewSource<S, T>, C>,
+    source: Scoped<
+      NewSource<S, T> & CheckSource<T, D & SelectionDialect<P>>,
+      C
+    >,
     on: Scoped<
-      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      On & CheckJoin<On, S, T, D & SelectionDialect<P>>,
       S & SourceEntry<NoInfer<T>>
     >
   ) => SelectQuery<
     S & SourceEntry<T>,
     P,
     N | T["name"],
-    D & SourceDialect<T>,
+    D & SourceDialect<T> & ExpressionDialect<On>,
     Override,
     C
   >;
   readonly rightJoin: <const T extends Source, const On extends PredicateInput>(
-    source: Scoped<NewSource<S, T>, C>,
+    source: Scoped<
+      NewSource<S, T> & CheckSource<T, D & SelectionDialect<P>>,
+      C
+    >,
     on: Scoped<
-      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      On & CheckJoin<On, S, T, D & SelectionDialect<P>>,
       S & SourceEntry<NoInfer<T>>
     >
   ) => SelectQuery<
     S & SourceEntry<T>,
     P,
     N | Extract<keyof S, string>,
-    D & SourceDialect<T>,
+    D & SourceDialect<T> & ExpressionDialect<On>,
     never,
     C
   >;
   readonly fullJoin: <const T extends Source, const On extends PredicateInput>(
-    source: Scoped<NewSource<S, T>, C>,
+    source: Scoped<
+      NewSource<S, T> &
+        CheckSource<T, Exclude<D, "mysql"> & SelectionDialect<P>>,
+      C
+    >,
     on: Scoped<
-      On & CheckInput<On, S & SourceEntry<NoInfer<T>>>,
+      On & CheckJoin<On, S, T, Exclude<D, "mysql"> & SelectionDialect<P>>,
       S & SourceEntry<NoInfer<T>>
     >
   ) => SelectQuery<
     S & SourceEntry<T>,
     P,
     N | Extract<keyof S, string> | T["name"],
-    Exclude<D & SourceDialect<T>, "mysql">,
+    Exclude<D & SourceDialect<T> & ExpressionDialect<On>, "mysql">,
     never,
     C
   >;
   readonly crossJoin: <const T extends Source>(
-    source: Scoped<NewSource<S, T>, C>
+    source: Scoped<NewSource<S, T> & CheckSource<T, D & SelectionDialect<P>>, C>
   ) => SelectQuery<S & SourceEntry<T>, P, N, D & SourceDialect<T>, Override, C>;
   readonly where: <const T extends PredicateInput>(
-    predicate: Scoped<T & CheckInput<T, S>, S>
-  ) => SelectQuery<S, P, N, D, Override, C>;
+    predicate: Scoped<T & CheckExpression<T, S, D & SelectionDialect<P>>, S>
+  ) => SelectQuery<S, P, N, D & ExpressionDialect<T>, Override, C>;
   readonly having: <const T extends PredicateInput>(
-    predicate: Scoped<T & CheckInput<T, S>, S>
-  ) => SelectQuery<S, P, N, D, Override, C>;
+    predicate: Scoped<T & CheckExpression<T, S, D & SelectionDialect<P>>, S>
+  ) => SelectQuery<S, P, N, D & ExpressionDialect<T>, Override, C>;
   readonly groupBy: {
     <const T extends readonly ExpressionInput[]>(
-      ...items: T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      ...items: T & CheckExpression<T[number], S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T[number]>, Override, C>;
     <const T extends ExpressionInput>(
-      item: (tables: S) => T & CheckInput<T, S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      item: (tables: S) => T & CheckExpression<T, S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T>, Override, C>;
     <const T extends readonly ExpressionInput[]>(
-      items: (tables: S) => T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      items: (
+        tables: S
+      ) => T & CheckExpression<T[number], S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T[number]>, Override, C>;
   };
   readonly orderBy: {
     <const T extends readonly OrderItem[]>(
-      ...items: T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      ...items: T & CheckExpression<T[number], S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T[number]>, Override, C>;
     <const T extends OrderItem>(
-      item: (tables: S) => T & CheckInput<T, S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      item: (tables: S) => T & CheckExpression<T, S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T>, Override, C>;
     <const T extends readonly OrderItem[]>(
-      items: (tables: S) => T & CheckInput<T[number], S>
-    ): SelectQuery<S, P, N, D, Override, C>;
+      items: (
+        tables: S
+      ) => T & CheckExpression<T[number], S, D & SelectionDialect<P>>
+    ): SelectQuery<S, P, N, D & ExpressionDialect<T[number]>, Override, C>;
   };
   readonly limit: (count: number) => SelectQuery<S, P, N, D, Override, C>;
   readonly offset: (count: number) => SelectQuery<S, P, N, D, Override, C>;
   readonly distinct: () => SelectQuery<S, P, N, D, Override, C>;
+  readonly distinctOn: <
+    const T extends readonly [ExpressionInput, ...ExpressionInput[]],
+  >(
+    ...items: T & CheckExpression<T[number], S, D & SelectionDialect<P> & "pg">
+  ) => SelectQuery<
+    S,
+    P,
+    N,
+    D & "pg" & ExpressionDialect<T[number]>,
+    Override,
+    C
+  >;
+  readonly forUpdate: (
+    ...check: [D & SelectionDialect<P> & ("pg" | "mysql")] extends [never]
+      ? [never]
+      : []
+  ) => SelectQuery<S, P, N, D & ("pg" | "mysql"), Override, C>;
 }
 
 type JoinedSource =
@@ -442,7 +540,9 @@ interface SelectState {
   }[];
   readonly selection?: Selection;
   readonly nullable: ReadonlySet<string>;
-  readonly distinct?: boolean;
+  readonly distinct?: true | readonly [SqlExpression, ...SqlExpression[]];
+  readonly dialect?: SqlDialect;
+  readonly forUpdate?: true;
   readonly where?: SqlExpression;
   readonly groupBy: readonly SqlExpression[];
   readonly having?: SqlExpression;
@@ -557,17 +657,6 @@ const relation: (
     presence,
   };
 };
-
-const unsupportedSelect = (message: string, cause: unknown = message) =>
-  Effect.fail(
-    new SqlError.SqlError({
-      reason: new SqlError.UnknownError({
-        cause,
-        message,
-        operation: "SELECT",
-      }),
-    })
-  );
 
 const copySelection = (selection: Selection) => {
   if (isSource(selection)) {
@@ -857,6 +946,30 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     return this.#copy({ distinct: true });
   }
 
+  distinctOn(...items: readonly ExpressionInput[]) {
+    this.#requireSimpleSelect();
+
+    if (!Arr.isReadonlyArrayNonEmpty(items)) {
+      throw new TypeError("DISTINCT ON requires at least one expression");
+    }
+
+    for (const item of items) {
+      checkInput(item, this.#state.scope);
+    }
+
+    const [first, ...rest] = items;
+
+    return this.#copy({
+      distinct: [toExpressionNode(first), ...rest.map(toExpressionNode)],
+    });
+  }
+
+  forUpdate() {
+    this.#requireSimpleSelect();
+
+    return this.#copy({ forUpdate: true });
+  }
+
   $if(condition: boolean, apply: (query: Query) => Query) {
     return condition ? apply(this) : this;
   }
@@ -911,7 +1024,9 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
   #ast() {
     const {
+      dialect,
       distinct,
+      forUpdate,
       groupBy,
       having,
       joins,
@@ -937,7 +1052,9 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     );
 
     return {
+      dialect,
       distinct,
+      forUpdate,
       from:
         source === undefined
           ? undefined
@@ -1020,15 +1137,13 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
         return Effect.succeed(statement);
       }
 
-      const dialect = client.onDialectOrElse({
-        mysql: () => "mysql" as const,
-        orElse: () => null,
-        pg: () => "pg" as const,
-        sqlite: () => "sqlite" as const,
-      });
+      const dialect = getClientDialect(client);
 
       if (dialect === null) {
-        return unsupportedSelect("SELECT is unsupported by this SQL driver");
+        return unsupportedDialect(
+          "SELECT",
+          "SELECT is unsupported by this SQL driver"
+        );
       }
 
       try {
@@ -1045,7 +1160,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
         return Effect.succeed(compiled);
       } catch (error) {
         if (error instanceof UnsupportedDialectClauseError) {
-          return unsupportedSelect(error.message, error);
+          return unsupportedDialect("SELECT", error.message, error);
         }
 
         throw error;
@@ -1092,38 +1207,57 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 }
 
-export function from<const T extends Source>(
-  source: T
-): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
-export function from(source: Source) {
-  return identity<object>(new Query(empty).from(source));
+export interface SelectEntrypoints<D extends SqlDialect> {
+  readonly from: <const T extends Source>(
+    source: T & CheckSource<T, D>
+  ) => SelectQuery<SourceEntry<T>, T, never, D & SourceDialect<T>>;
+  readonly select: {
+    <const T extends Source>(
+      selection: T & CheckSource<T, D>
+    ): SelectQuery<SourceEntry<T>, T, never, D & SourceDialect<T>>;
+    <const P extends Exclude<Selection, Source>>(
+      selection: P &
+        (Extract<keyof P, symbol> extends never ? unknown : never) &
+        CheckDialect<D & NoInfer<SelectionDialect<P>>>
+    ): SelectQuery<EmptyScope, P, never, D>;
+  };
+  readonly withCte: <const Name extends string, Q extends QueryOperand>(
+    name: Name,
+    query: Q & CheckOperand<Q, D>
+  ) => SelectQuery<
+    EmptyScope,
+    never,
+    never,
+    D & OperandDialect<Q>,
+    never,
+    SourceEntry<OperandSource<Name, Q>>
+  >;
 }
 
-export function select<const T extends Source>(
-  selection: T
-): SelectQuery<SourceEntry<T>, T, never, SourceDialect<T>>;
-export function select<const P extends Exclude<Selection, Source>>(
-  selection: P & (Extract<keyof P, symbol> extends never ? unknown : never)
-): SelectQuery<EmptyScope, P>;
-export function select(selection: Selection) {
-  const query = new Query(empty);
+export function selectForDialect<const D extends SqlDialect = SqlDialect>(
+  dialect?: D
+): SelectEntrypoints<D>;
+export function selectForDialect(dialect?: SqlDialect) {
+  const state: SelectState = { ...empty, dialect };
 
-  return identity<object>(
-    isSource(selection) ? query.from(selection) : query.select(selection)
-  );
+  return identity<object>({
+    from: (source: Source) => new Query(state).from(source),
+    select: (selection: Selection) => {
+      const query = new Query(state);
+
+      return isSource(selection)
+        ? query.from(selection)
+        : query.select(selection);
+    },
+    withCte: (name: string, query: QueryOperand) =>
+      new Query(state).with(name, query),
+  });
 }
 
-export function withCte<const Name extends string, Q extends QueryOperand>(
-  name: Name,
-  query: Q
-): SelectQuery<
-  EmptyScope,
-  never,
-  never,
-  OperandDialect<Q>,
-  never,
-  SourceEntry<OperandSource<Name, Q>>
->;
-export function withCte(name: string, query: QueryOperand) {
-  return identity<object>(new Query(empty).with(name, query));
-}
+const portable = selectForDialect();
+
+export const from: SelectEntrypoints<SqlDialect>["from"] = portable.from;
+export const select: SelectEntrypoints<SqlDialect>["select"] = portable.select;
+
+export const withCte: SelectEntrypoints<SqlDialect>["withCte"] =
+  portable.withCte;

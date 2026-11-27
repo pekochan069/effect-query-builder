@@ -30,13 +30,13 @@ jobs:
           echo "$RUNNER_TEMP/dafny" >> "$GITHUB_PATH"
       - run: bun install --frozen-lockfile
       - run: bun run check-types
-      - run: bun run check
-      - run: bun test
       - name: Check published declarations
         working-directory: packages/effect-query-builder
         run: |
           bun run build
           bun run tsc --project tsconfig.consumer.json
+      - run: bun run check
+      - run: bun test
       - run: npm install --global lemmascript@0.6.14
       - run: lsc check --backend=dafny
       - name: Check Dafny artifacts for drift

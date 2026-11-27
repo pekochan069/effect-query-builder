@@ -38,6 +38,12 @@ type ScalarFields<P> = P extends TableSource
 
 export type ScalarKey<P> = Extract<keyof ScalarFields<P>, string>;
 
+export type NonScalarKey<P> = P extends TableSource
+  ? never
+  : P extends DerivedSource
+    ? NonNullable<P[typeof DerivedTypeId]["nonScalarKeys"]>
+    : Exclude<StringKey<keyof P>, ScalarKey<P>>;
+
 type FieldSqlValue<P, Key extends ScalarKey<P>> =
   FieldSchema<P, Key> extends ProjectedSqlValue<infer Value>
     ? Value
@@ -48,11 +54,17 @@ export type ScalarValue<P, Key extends ScalarKey<P>> = FieldSqlValue<
   Key
 > | null;
 
-type FieldSchema<P, Key extends ScalarKey<P>> = ScalarFields<P>[Key] extends
-  | Column
-  | Expression
+export type FieldSchema<
+  P,
+  Key extends ScalarKey<P>,
+> = ScalarFields<P>[Key] extends Column | Expression
   ? ScalarFields<P>[Key]["schema"]
   : never;
+
+export type ScalarEncoded<P, Key extends ScalarKey<P>> = FieldSchema<
+  P,
+  Key
+>["Encoded"];
 
 type FieldValue<Row, Key extends string> = Key extends keyof NonNullable<Row>
   ? NonNullable<Row>[Key]
@@ -91,8 +103,12 @@ export interface DerivedSource<
   Row = unknown,
   R = unknown,
   Dialect extends SqlDialect = SqlDialect,
+  NonScalarKeys extends string = string,
 > {
-  readonly [DerivedTypeId]: DerivedDefinition & { readonly dialect?: Dialect };
+  readonly [DerivedTypeId]: DerivedDefinition & {
+    readonly dialect?: Dialect;
+    readonly nonScalarKeys?: NonScalarKeys;
+  };
   readonly name: Name;
   readonly c: Columns;
   readonly decodeRow: (
@@ -102,9 +118,14 @@ export interface DerivedSource<
 
 export type Source = TableSource | DerivedSource;
 
-export type SourceDialect<T extends Source> = T extends DerivedSource
-  ? NonNullable<T[typeof DerivedTypeId]["dialect"]>
-  : SqlDialect;
+type ExcludedSourceDialects<T> = T extends DerivedSource
+  ? Exclude<SqlDialect, NonNullable<T[typeof DerivedTypeId]["dialect"]>>
+  : never;
+
+export type SourceDialect<T extends Source> = Exclude<
+  SqlDialect,
+  ExcludedSourceDialects<T>
+>;
 
 export type DerivedSelection<
   Name extends string,
@@ -123,7 +144,8 @@ export type DerivedSelection<
   },
   Row,
   R,
-  D
+  D,
+  NonScalarKey<P>
 >;
 
 export const isDerivedSource = <T>(value: T): value is T & DerivedSource =>
@@ -185,7 +207,8 @@ type AliasedDerived<
   },
   Effect.Success<ReturnType<S["decodeRow"]>>,
   Effect.Services<ReturnType<S["decodeRow"]>>,
-  SourceDialect<S>
+  SourceDialect<S>,
+  NonScalarKey<S>
 >;
 
 export function alias<const S extends DerivedSource, const Name extends string>(

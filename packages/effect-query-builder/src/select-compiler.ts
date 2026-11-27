@@ -1,16 +1,17 @@
+import { Predicate } from "effect";
 import { Statement } from "effect/sql";
 
-import type { SelectStatement } from "./kernel/ast.ts";
-import { renderSelect } from "./kernel/compile.ts";
-import type { SqlDialect } from "./kernel/compile.ts";
+import type { Statement as QueryStatement } from "./kernel/ast.ts";
+import { renderStatement } from "./kernel/compile.ts";
+import type { CompileTarget, SqlDialect } from "./kernel/compile.ts";
 
-export const toSelectFragment = (
-  query: SelectStatement<Statement.Fragment>,
-  dialect?: SqlDialect
+export const toStatementFragment = (
+  query: QueryStatement<Statement.Fragment>,
+  target?: CompileTarget
 ) => {
   const segments: Statement.Segment[] = [];
 
-  renderSelect(dialect, query, (token) => {
+  renderStatement(target, query, (token) => {
     switch (token.kind) {
       case "text": {
         segments.push(Statement.literal(token.text));
@@ -68,14 +69,19 @@ const compilers = {
   sqlite: makeCompiler("sqlite"),
 } satisfies Record<SqlDialect, Statement.Compiler>;
 
-export const compileSelect = (
-  query: SelectStatement<Statement.Fragment>,
-  dialect: SqlDialect
+export const compileStatement = (
+  query: QueryStatement<Statement.Fragment>,
+  target: CompileTarget
 ) => {
+  const dialect = Predicate.isString(target) ? target : target.dialect;
+
   const [sql, params] = compilers[dialect].compile(
-    toSelectFragment(query, dialect),
+    toStatementFragment(query, target),
     true
   );
 
   return { params, sql };
 };
+
+export const toSelectFragment = toStatementFragment;
+export const compileSelect = compileStatement;
