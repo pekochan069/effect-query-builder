@@ -149,7 +149,13 @@ const missing = (row: SqlConnection.Row, marker: string | undefined) => {
 
   const value = row[marker];
 
-  return value === false || value === 0 || value === 0n || value === "0";
+  return (
+    value === null ||
+    value === false ||
+    value === 0 ||
+    value === 0n ||
+    value === "0"
+  );
 };
 
 const projectObject =
