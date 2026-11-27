@@ -4,10 +4,9 @@ import {
   Effect,
   Effectable,
   Predicate,
-  Schema,
   Stream,
 } from "effect";
-import type { Option, Types } from "effect";
+import type { Option, Types, Schema } from "effect";
 import { flatMap, forEach, map } from "effect/Effect";
 import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
@@ -16,6 +15,7 @@ import {
   isExpression,
   isOrdering,
   makeExpression,
+  sqlNullOr,
   toExpressionNode,
 } from "./expression.ts";
 import type {
@@ -55,6 +55,7 @@ import type {
   DerivedSelection,
   ScalarKey,
   ScalarSchema,
+  ScalarValue,
   Source,
   SourceDialect,
 } from "./select-source.ts";
@@ -218,7 +219,8 @@ interface SelectResult<
   ) => SelectExpression<
     ScalarSchema<P, Key, Result<P, N, Override>>,
     never,
-    D & SelectionDialect<P>
+    D & SelectionDialect<P>,
+    ScalarValue<P, Key>
   >;
   readonly with: <const Name extends string, Q extends QueryOperand>(
     name: Name & (Name extends keyof C ? never : unknown),
@@ -668,7 +670,7 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       },
     } satisfies SqlExpression;
 
-    return makeExpression(Schema.NullOr(field.schema), node, []);
+    return makeExpression(sqlNullOr(field.schema), node, []);
   }
 
   with(name: string, operand: Scoped<QueryOperand>) {

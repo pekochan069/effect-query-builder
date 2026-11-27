@@ -1,4 +1,5 @@
 import { Predicate, Schema, SchemaTransformation } from "effect";
+import type { SchemaAST } from "effect";
 import { Statement } from "effect/sql";
 
 import { inferColumnStorage } from "./column-storage.ts";
@@ -10,14 +11,18 @@ import type { Column } from "./table.ts";
 const ExpressionTypeId = Symbol("effect-query-builder/Expression");
 const OrderingTypeId = Symbol("effect-query-builder/Ordering");
 declare const ExpressionDialectTypeId: unique symbol;
+declare const ExpressionSqlValueTypeId: unique symbol;
+declare const ProjectedSqlValueTypeId: unique symbol;
 
 export interface Expression<
   S extends Schema.Constraint = Schema.Constraint,
   Refs extends Column = Column,
   Dialect extends SqlDialect = SqlDialect,
+  Value = S["Type"],
 > {
   readonly [ExpressionTypeId]: true;
   readonly [ExpressionDialectTypeId]?: Dialect;
+  readonly [ExpressionSqlValueTypeId]?: Value;
   readonly schema: S;
   readonly node: ExpressionNode<Statement.Fragment>;
   readonly references: readonly Refs[];
@@ -73,10 +78,17 @@ type Node = ExpressionNode<Statement.Fragment>;
 
 type Operator = Extract<Node, { kind: "binary" }>["operator"];
 
-type SqlValue<Input> = Input extends Column
-  ? Input["schema"]["Encoded"]
-  : Input extends Expression
-    ? Input["schema"]["Type"]
+export interface ProjectedSqlValue<Value> {
+  readonly [ProjectedSqlValueTypeId]: Value;
+}
+
+type ColumnSqlValue<S extends Schema.Constraint> =
+  S extends ProjectedSqlValue<infer Value> ? Value : S["Encoded"];
+
+export type SqlValue<Input> = Input extends Column
+  ? ColumnSqlValue<Input["schema"]>
+  : Input extends Expression<Schema.Constraint, Column, SqlDialect, infer Value>
+    ? Value
     : Input extends Statement.Fragment
       ? unknown
       : Input;
@@ -91,6 +103,9 @@ type EncodedValue<Input> = Input extends ScalarExpression
 
 type NullableSchema<S extends Schema.Constraint, Input> =
   null extends EncodedValue<Input> ? Schema.NullOr<S> : S;
+
+export const sqlNullOr = <S extends Schema.Constraint>(schema: S) =>
+  Schema.Union([Schema.Null, schema]);
 
 const booleanSchema = Schema.Union([Schema.Boolean, Schema.BooleanFromBit]);
 
@@ -116,6 +131,34 @@ const numberSchema = Schema.Union([
   integerFromBigInt,
 ]);
 
+type SqlFamily = "boolean" | "number";
+
+const expressionFamilies = new Map<SchemaAST.AST, SqlFamily>([
+  [booleanSchema.ast, "boolean"],
+  [countSchema.ast, "number"],
+  [numberSchema.ast, "number"],
+]);
+
+export const expressionSqlFamily: (
+  ast: SchemaAST.AST
+) => SqlFamily | undefined = (ast) => {
+  const family = expressionFamilies.get(ast);
+
+  if (
+    family !== undefined ||
+    ast._tag !== "Union" ||
+    ast.encoding !== undefined
+  ) {
+    return family;
+  }
+
+  const [value, ...rest] = ast.types.filter((part) => part._tag !== "Null");
+
+  return value !== undefined && rest.length === 0
+    ? expressionSqlFamily(value)
+    : undefined;
+};
+
 export const isExpression = <Input>(
   value: Input
 ): value is Input & Expression =>
@@ -130,12 +173,13 @@ export const makeExpression = <
   S extends Schema.Constraint,
   Refs extends Column,
   Dialect extends SqlDialect = SqlDialect,
+  Value = S["Type"],
 >(
   schema: S,
   node: Node,
   references: readonly Refs[]
 ) =>
-  Object.freeze<Expression<S, Refs, Dialect>>({
+  Object.freeze<Expression<S, Refs, Dialect, Value>>({
     [ExpressionTypeId]: true,
     node,
     references: Object.freeze(references),
@@ -187,6 +231,7 @@ function referencesOf(operands: readonly unknown[]) {
 const composeExpression = <
   S extends Schema.Constraint,
   Operands extends readonly (Operand | Statement.Fragment)[],
+  Value = S["Type"],
 >(
   schema: S,
   node: Node,
@@ -195,7 +240,8 @@ const composeExpression = <
   makeExpression<
     S,
     InputReferences<Operands[number]>,
-    ExpressionDialect<Operands[number]>
+    ExpressionDialect<Operands[number]>,
+    Value
   >(schema, node, referencesOf(operands));
 
 const mayBeNull = (operand: Operand | Statement.Fragment) => {
@@ -459,8 +505,12 @@ const extremum =
   <Input extends ScalarExpression>(
     operand: Input & Matches<Input, Orderable>
   ) =>
-    composeExpression(
-      Schema.NullOr<Input["schema"]>(operand.schema),
+    composeExpression<
+      ReturnType<typeof sqlNullOr<Input["schema"]>>,
+      readonly [Input],
+      SqlValue<Input> | null
+    >(
+      sqlNullOr<Input["schema"]>(operand.schema),
       { kind: "aggregate", name, operand: toExpressionNode(operand) },
       [operand]
     );

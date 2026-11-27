@@ -7,12 +7,15 @@ import { SqlClient, SqlError, Statement } from "effect/sql";
 import type { SqlConnection } from "effect/sql";
 
 import {
+  add,
   alias,
   count,
   desc,
   eq,
   from,
   gt,
+  max,
+  min,
   neq,
   raw,
   select,
@@ -212,6 +215,109 @@ test("uses a named scalar subquery and decodes an empty scalar as null", () => {
   expect(
     Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
   ).toEqual([{ first: "Ada", missing: null }]);
+});
+
+test("decodes SQL NULL before the scalar field's Option codec", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+
+  const base = from(books);
+
+  const note = (id: number) =>
+    base.where(eq(books.c.authorId, id)).scalar("note");
+
+  const query = select({
+    missing: note(0),
+    nullNote: note(1),
+    present: note(2),
+  });
+
+  expectTypeOf<
+    Effect.Success<typeof query>[number]["present"]
+  >().toEqualTypeOf<Option.Option<string> | null>();
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([
+    { missing: null, nullNote: null, present: Option.some("reviewed") },
+  ]);
+});
+
+test("decodes SQL NULL before the MIN and MAX operand's Option codec", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+
+  const extrema = from(books).select({
+    minimum: min(books.c.note),
+    maximum: max(books.c.note),
+  });
+
+  const run = (id: number) =>
+    Effect.runSync(
+      Effect.provideService(
+        extrema.where(eq(books.c.authorId, id)).findOne(),
+        SqlClient.SqlClient,
+        sql
+      )
+    );
+
+  expect(run(0)).toEqual({ minimum: null, maximum: null });
+  expect(run(1)).toEqual({ minimum: null, maximum: null });
+  expect(run(2)).toEqual({
+    minimum: Option.some("reviewed"),
+    maximum: Option.some("reviewed"),
+  });
+});
+
+test("compares scalar subqueries and extrema using the operands' SQL values", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+
+  const branded = Table.fromSchema(
+    "authors",
+    Schema.Struct({ id: Schema.Int.pipe(Schema.brand("AuthorId")) })
+  );
+
+  const { id } = branded.c;
+  const { note, authorId } = books.c;
+  const selectedId = from(branded).where(eq(id, 2)).scalar("id");
+  const selectedNote = from(books).where(eq(authorId, 2)).scalar("note");
+
+  const brandedMatch = from(branded)
+    .where(eq(id, selectedId))
+    .where(eq(selectedId, id))
+    .select({ minimum: eq(min(id), id), maximum: eq(id, max(id)) })
+    .groupBy(id);
+
+  const optionalMatch = from(books)
+    .where(eq(note, selectedNote))
+    .where(eq(selectedNote, note))
+    .select({ minimum: eq(note, min(note)), maximum: eq(max(note), note) })
+    .groupBy(note);
+
+  const provided = Effect.provideService(SqlClient.SqlClient, sql);
+
+  for (const query of [brandedMatch, optionalMatch]) {
+    expect(Effect.runSync(query.pipe(provided))).toEqual([
+      { minimum: true, maximum: true },
+    ]);
+  }
+});
+
+test("uses the same SQL number type for a built-in result through a scalar subquery", () => {
+  using db = new Database(":memory:");
+  const sql = fixture(db);
+  const { id } = authors.c;
+  const counts = from(books).select({ total: count() });
+  const stats = counts.as("stats");
+
+  const query = from(authors)
+    .where(eq(id, counts.scalar("total")))
+    .where(eq(from(stats).scalar("total"), id))
+    .select({ id, unchanged: eq(id, add(add(id, 0), 0)) });
+
+  expect(
+    Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+  ).toEqual([{ id: 2, unchanged: true }]);
 });
 
 test("carries numeric projection keys into derived columns and scalars", () => {

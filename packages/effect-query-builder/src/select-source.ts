@@ -2,7 +2,12 @@ import { Predicate, Schema } from "effect";
 import type { Effect } from "effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
-import type { Expression } from "./expression.ts";
+import type {
+  Expression,
+  ProjectedSqlValue,
+  sqlNullOr,
+  SqlValue,
+} from "./expression.ts";
 import type { SelectStatement } from "./kernel/ast.ts";
 import type { SelectDialect } from "./select-compiler.ts";
 import type { ProjectionPlan, Selection } from "./select-projection.ts";
@@ -32,6 +37,15 @@ type ScalarFields<P> = P extends TableSource
 
 export type ScalarKey<P> = Extract<keyof ScalarFields<P>, string>;
 
+type FieldSqlValue<P, Key extends ScalarKey<P>> = SqlValue<
+  ScalarFields<P>[Key]
+>;
+
+export type ScalarValue<P, Key extends ScalarKey<P>> = FieldSqlValue<
+  P,
+  Key
+> | null;
+
 type FieldSchema<P, Key extends ScalarKey<P>> = ScalarFields<P>[Key] extends
   | Column
   | Expression
@@ -44,16 +58,17 @@ type FieldValue<Row, Key extends string> = Key extends keyof NonNullable<Row>
     ? NonNullable<Row>[NumericKey & keyof NonNullable<Row>]
     : never;
 
-type ProjectedSchema<P, Key extends ScalarKey<P>, Row> = Schema.Constraint & {
-  readonly Type: FieldValue<Row, Key> | (null extends Row ? null : never);
-  readonly Encoded:
-    | FieldSchema<P, Key>["Encoded"]
-    | (null extends Row | FieldValue<Row, Key> ? null : never);
-  readonly DecodingServices: FieldSchema<P, Key>["DecodingServices"];
-};
+type ProjectedSchema<P, Key extends ScalarKey<P>, Row> = Schema.Constraint &
+  ProjectedSqlValue<FieldSqlValue<P, Key>> & {
+    readonly Type: FieldValue<Row, Key> | (null extends Row ? null : never);
+    readonly Encoded:
+      | FieldSchema<P, Key>["Encoded"]
+      | (null extends Row | FieldValue<Row, Key> ? null : never);
+    readonly DecodingServices: FieldSchema<P, Key>["DecodingServices"];
+  };
 
-export type ScalarSchema<P, Key extends ScalarKey<P>, Row> = Schema.NullOr<
-  ProjectedSchema<P, Key, Row>
+export type ScalarSchema<P, Key extends ScalarKey<P>, Row> = ReturnType<
+  typeof sqlNullOr<ProjectedSchema<P, Key, Row>>
 >;
 
 interface DerivedDefinition {
