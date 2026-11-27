@@ -36,7 +36,11 @@ import type {
 import type { SqlDialect } from "./kernel/compile.ts";
 import { UnsupportedDialectClauseError } from "./kernel/errors.ts";
 import { compileSelect, toSelectFragment } from "./select-compiler.ts";
-import { alignSetProjection, planProjection } from "./select-projection.ts";
+import {
+  alignSetProjection,
+  planProjection,
+  withNumericSetTransport,
+} from "./select-projection.ts";
 import type {
   DecodeServices,
   ProjectionPlan,
@@ -662,7 +666,11 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
       },
     } satisfies SqlExpression;
 
-    return makeExpression(sqlNullOr(field.schema), node, []);
+    return makeExpression(
+      sqlNullOr(field.resultSchema ?? field.schema),
+      node,
+      []
+    );
   }
 
   with(name: string, operand: Scoped<QueryOperand>) {
@@ -877,16 +885,25 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
 
   #plan() {
     if (this.#planCache === undefined) {
-      const { groupBy, nullable, scope } = this.#state;
+      const { groupBy, nullable, scope, sets } = this.#state;
       const selected = this.#selection();
 
       checkSelection(selected, scope);
-      this.#planCache = planProjection(
+
+      const plan = planProjection(
         selected,
         scope,
         nullable,
         groupBy.length > 0
       );
+
+      this.#planCache =
+        sets.length > 0
+          ? withNumericSetTransport(
+              plan,
+              sets.map(({ operand }) => operand.plan)
+            )
+          : plan;
     }
 
     return this.#planCache;

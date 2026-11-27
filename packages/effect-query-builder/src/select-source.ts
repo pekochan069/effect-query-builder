@@ -2,6 +2,7 @@ import { Predicate, Schema } from "effect";
 import type { Effect } from "effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
+import { setColumnResultSchema } from "./expression.ts";
 import type {
   Expression,
   ProjectedSqlValue,
@@ -143,15 +144,20 @@ export const makeDerivedSource = (
   const { plan } = definition;
 
   const c = Object.fromEntries(
-    Object.entries(plan.fields).map(([key, field]) => [
-      key,
-      projectionColumn(
+    Object.entries(plan.fields).map(([key, field]) => {
+      const column = projectionColumn(
         name,
         key,
         field.alias,
         field.nullable ? Schema.NullOr(field.schema) : field.schema
-      ),
-    ])
+      );
+
+      if (field.resultSchema !== undefined) {
+        setColumnResultSchema(column, field.resultSchema);
+      }
+
+      return [key, column];
+    })
   );
 
   return Object.freeze<DerivedSource>({

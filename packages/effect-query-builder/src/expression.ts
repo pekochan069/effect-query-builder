@@ -130,7 +130,7 @@ const numberSchema = Schema.Union([
 
 type SqlFamily = "boolean" | "boolean bit" | "number";
 
-const expressionFamilies = new Map<SchemaAST.AST, SqlFamily>([
+const expressionFamilies = new WeakMap<SchemaAST.AST, SqlFamily>([
   [booleanSchema.ast, "boolean"],
   [Schema.BooleanFromBit.ast, "boolean bit"],
   [countSchema.ast, "number"],
@@ -156,6 +156,24 @@ export const expressionSqlFamily: (
     ? expressionSqlFamily(value)
     : undefined;
 };
+
+export const bigintResultSchema = (schema: Schema.Constraint) => {
+  const result = Schema.Union([
+    schema,
+    integerFromBigInt.pipe(Schema.decodeTo(schema)),
+  ]);
+
+  expressionFamilies.set(result.ast, "number");
+
+  return result;
+};
+
+const columnResultSchemas = new WeakMap<Column, Schema.Constraint>();
+
+export const setColumnResultSchema = (
+  column: Column,
+  schema: Schema.Constraint
+) => columnResultSchemas.set(column, schema);
 
 export const isExpression = <Input>(
   value: Input
@@ -498,20 +516,29 @@ const numericAggregate =
 export const sum = numericAggregate("SUM");
 export const avg = numericAggregate("AVG");
 
-const extremum =
-  (name: "MIN" | "MAX") =>
-  <Input extends ScalarExpression>(
+const extremum = (name: "MIN" | "MAX") => {
+  function aggregate<Input extends ScalarExpression>(
     operand: Input & Matches<Input, Orderable>
-  ) =>
-    composeExpression<
-      ReturnType<typeof sqlNullOr<Input["schema"]>>,
-      readonly [Input],
-      SqlValue<Input> | null
-    >(
-      sqlNullOr<Input["schema"]>(operand.schema),
+  ): Expression<
+    ReturnType<typeof sqlNullOr<Input["schema"]>>,
+    InputReferences<Input>,
+    ExpressionDialect<Input>,
+    SqlValue<Input> | null
+  >;
+  function aggregate(operand: ScalarExpression) {
+    const resultSchema = isColumn(operand)
+      ? columnResultSchemas.get(operand)
+      : undefined;
+
+    return composeExpression(
+      sqlNullOr(resultSchema ?? operand.schema),
       { kind: "aggregate", name, operand: toExpressionNode(operand) },
       [operand]
     );
+  }
+
+  return aggregate;
+};
 
 export const min = extremum("MIN");
 export const max = extremum("MAX");

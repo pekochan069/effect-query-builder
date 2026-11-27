@@ -513,6 +513,139 @@ test("combines numeric expressions with columns in either set operand", () => {
   );
 });
 
+test("decodes bigint transport from a numeric set through the left row schema", () => {
+  using db = new Database(":memory:", { safeIntegers: true });
+
+  const sql = fixture(db);
+
+  const totals = Table.fromSchema(
+    "totals",
+    Schema.Struct({ value: Schema.Int })
+  );
+
+  db.run("CREATE TABLE totals (value INTEGER)");
+  db.run("INSERT INTO totals VALUES (1), (3)");
+
+  const query = from(totals).union(from(books).select({ value: count() }));
+
+  expect(
+    Effect.runSync(
+      query.pipe(
+        Effect.map((rows) =>
+          rows.map(({ value }) => value).toSorted((a, b) => a - b)
+        ),
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.exit
+      )
+    )
+  ).toEqual(Exit.succeed([1, 2, 3]));
+});
+
+test("preserves bigint transport decoding through derived set results", () => {
+  using db = new Database(":memory:", { safeIntegers: true });
+
+  const sql = fixture(db);
+
+  const totals = Table.fromSchema(
+    "totals",
+    Schema.Struct({ value: Schema.Int })
+  );
+
+  db.run("CREATE TABLE totals (value INTEGER)");
+  db.run("INSERT INTO totals VALUES (1), (3)");
+
+  const base = from(totals);
+  const combined = base.union(from(books).select({ value: count() }));
+  const derived = combined.as("combined");
+  const forwarded = from(derived).select({ value: derived.c.value });
+
+  const fromCte = withCte("cte", forwarded)
+    .from(({ cte }) => cte)
+    .select(({ cte }) => ({ value: cte.c.value }));
+
+  expect(
+    Effect.runSync(
+      Effect.gen(function* readDerivedSet() {
+        return {
+          cte: yield* fromCte.orderBy(({ cte }) => cte.c.value),
+          extrema: yield* from(derived).select({
+            minimum: min(derived.c.value),
+            maximum: max(derived.c.value),
+          }),
+          nested: (yield* base.union(fromCte)).toSorted(
+            (a, b) => a.value - b.value
+          ),
+          scalar: yield* select({
+            middle: forwarded.where(eq(derived.c.value, 2)).scalar("value"),
+          }),
+        };
+      }).pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.exit)
+    )
+  ).toEqual(
+    Exit.succeed({
+      cte: [{ value: 1 }, { value: 2 }, { value: 3 }],
+      extrema: [{ minimum: 1, maximum: 3 }],
+      nested: [{ value: 1 }, { value: 2 }, { value: 3 }],
+      scalar: [{ middle: 2 }],
+    })
+  );
+});
+
+test("limits bigint normalization to safe integers in the promoted result fields", () => {
+  using db = new Database(":memory:", { safeIntegers: true });
+  const sql = fixture(db);
+  const total = from(books).select({ value: count() });
+
+  const tooLarge = select({
+    value: raw(Schema.Number, sql`9007199254740993`),
+  }).union(total);
+
+  const derived = tooLarge.as("large_values");
+  const plain = select({ value: raw(Schema.Int, sql`1`) });
+
+  const unrelated = select({
+    value: raw(Schema.Int, sql`1`),
+    guard: raw(Schema.Int, sql`1`),
+  }).union(
+    from(books).select({ value: count(), guard: raw(Schema.Int, sql`1`) })
+  );
+
+  const checked = select({
+    value: raw(Schema.Int.check(Schema.isGreaterThan(0)), sql`-1`),
+  }).union(total);
+
+  const run = Effect.provideService(SqlClient.SqlClient, sql);
+
+  const failure = (
+    query: Effect.Effect<
+      unknown,
+      Schema.SchemaError | SqlError.SqlError,
+      SqlClient.SqlClient
+    >
+  ) =>
+    Effect.runSync(query.pipe(run, Effect.result)).pipe(
+      Result.getFailure,
+      Option.getOrUndefined
+    );
+
+  const unsafeScalar = select({
+    value: from(derived)
+      .orderBy(desc(derived.c.value))
+      .limit(1)
+      .scalar("value"),
+  });
+
+  for (const query of [tooLarge, plain, unrelated]) {
+    const error = failure(query);
+
+    expect(error).toBeInstanceOf(Schema.SchemaError);
+    expect(error?.message).toContain("Expected number");
+  }
+
+  expect(failure(unsafeScalar)?.message).toContain("Expected an integer");
+  expect(failure(checked)?.message).toContain("greater than 0");
+});
+
 test("combines predicates with columns that decode SQLite boolean bits", () => {
   using db = new Database(":memory:");
   const sql = fixture(db);

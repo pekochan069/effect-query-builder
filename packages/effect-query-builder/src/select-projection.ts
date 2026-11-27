@@ -1,8 +1,10 @@
 import { Array as Arr, Effect, Predicate, Schema, SchemaAST } from "effect";
+import type { Types } from "effect";
 import { forEach, map } from "effect/Effect";
 import type { SqlConnection, Statement } from "effect/sql";
 
 import {
+  bigintResultSchema,
   expressionSqlFamily,
   isExpression,
   toExpressionNode,
@@ -79,6 +81,7 @@ type Decode = (
 export interface ProjectionField {
   readonly alias: string;
   readonly schema: Schema.Constraint;
+  readonly resultSchema?: Schema.Constraint;
   readonly inputs: readonly string[];
   readonly nullable: boolean;
   readonly decode: Decode;
@@ -186,6 +189,7 @@ interface ProjectionSlot {
   readonly markers?: readonly string[];
   readonly encoding?: string;
   readonly booleanCodec?: "predicate" | "bit";
+  readonly bigintTransport?: true;
 }
 
 const literalFamily = (value: SchemaAST.LiteralValue) => {
@@ -234,11 +238,13 @@ const encodedFamily: (ast: SchemaAST.AST) => string | undefined = (ast) => {
 
 const projectionEncoding: (
   schema: Schema.Constraint
-) => Pick<ProjectionSlot, "encoding" | "booleanCodec"> = (schema) => {
+) => Pick<ProjectionSlot, "encoding" | "booleanCodec" | "bigintTransport"> = (
+  schema
+) => {
   const family = expressionSqlFamily(schema.ast);
 
   if (family === "number") {
-    return { encoding: family };
+    return { bigintTransport: true, encoding: family };
   }
 
   const encoding = encodedFamily(SchemaAST.toEncoded(schema.ast));
@@ -264,6 +270,81 @@ const requiresMarkers = (
 ) => (marker === undefined ? inherited : [...inherited, marker]);
 
 type ProjectionColumn = ProjectionPlan["columns"][number];
+
+const normalizeBigInts = (
+  row: SqlConnection.Row,
+  aliases: Iterable<string>
+) => {
+  let mapped: Types.Mutable<SqlConnection.Row> | undefined;
+
+  for (const alias of aliases) {
+    const value = row[alias];
+
+    if (Predicate.isBigInt(value)) {
+      const number = Number(value);
+
+      if (Number.isSafeInteger(number)) {
+        mapped ??= { ...row };
+        mapped[alias] = number;
+      }
+    }
+  }
+
+  return mapped ?? row;
+};
+
+export const withNumericSetTransport: (
+  plan: ProjectionPlan,
+  operands: readonly ProjectionPlan[]
+) => ProjectionPlan = (plan, operands) => {
+  const promotedPaths = new Set(
+    operands.flatMap(({ columns }) =>
+      columns
+        .filter(({ slot }) => slot.bigintTransport)
+        .map(({ slot }) => JSON.stringify(slot.path))
+    )
+  );
+
+  const promotedAliases = new Set(
+    plan.columns.flatMap(({ alias, slot }) =>
+      slot.encoding === "number" &&
+      !slot.bigintTransport &&
+      promotedPaths.has(JSON.stringify(slot.path))
+        ? [alias]
+        : []
+    )
+  );
+
+  if (promotedAliases.size === 0) {
+    return plan;
+  }
+
+  const [first, ...rest] = plan.columns;
+
+  const promoteColumn = (column: ProjectionColumn) =>
+    promotedAliases.has(column.alias)
+      ? { ...column, slot: { ...column.slot, bigintTransport: true } as const }
+      : column;
+
+  return {
+    ...plan,
+    columns: [promoteColumn(first), ...rest.map(promoteColumn)],
+    decode: (row) => plan.decode(normalizeBigInts(row, promotedAliases)),
+    fields: Object.fromEntries(
+      Object.entries(plan.fields).map(([key, field]) => [
+        key,
+        promotedAliases.has(field.alias)
+          ? {
+              ...field,
+              decode: (row: SqlConnection.Row) =>
+                field.decode(normalizeBigInts(row, [field.alias])),
+              resultSchema: bigintResultSchema(field.schema),
+            }
+          : field,
+      ])
+    ),
+  };
+};
 
 const projectionLayout = (columns: readonly ProjectionColumn[]) => {
   const positions = new Map(columns.map(({ alias }, index) => [alias, index]));
@@ -497,6 +578,7 @@ export const planProjection: (
     }
 
     return {
+      ...field,
       alias,
       decode: remapDecode(field.decode, aliases, marker),
       inputs: [
@@ -504,7 +586,6 @@ export const planProjection: (
         ...(marker === undefined ? [] : [marker]),
       ],
       nullable: field.nullable || marker !== undefined,
-      schema: field.schema,
     };
   };
 
@@ -641,7 +722,7 @@ export const planProjection: (
       const alias = add(
         { kind: "column", name: field.alias, table: source.name },
         {
-          ...projectionEncoding(field.schema),
+          ...projectionEncoding(field.resultSchema ?? field.schema),
           markers: requiresMarkers(marker, markers),
           path,
           role: "value",
