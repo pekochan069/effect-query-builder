@@ -9,6 +9,7 @@ import type { SqlConnection } from "effect/sql";
 import {
   alias,
   count,
+  desc,
   eq,
   from,
   gt,
@@ -442,5 +443,84 @@ test.each(["subquery", "CTE"] as const)(
         { id: 3, joinedId: 3, bookAuthor: null, note: null },
       ])
     );
+  }
+);
+
+const unexpectedClauseCallback = () => {
+  throw new Error("Clause callback ran on a compound SELECT");
+};
+
+test.each(["union", "unionAll", "intersect", "except"] as const)(
+  "requires wrapping %s before adding SELECT clauses",
+  (operator) => {
+    using db = new Database(":memory:");
+    const sql = fixture(db);
+    const base = from(authors).select({ id: authors.c.id });
+    const first = base.orderBy(authors.c.id).limit(2);
+    const second = base.orderBy(desc(authors.c.id)).limit(1);
+    const compound = first[operator](second);
+
+    // @ts-expect-error Compound queries do not expose single-SELECT clauses.
+    const runtime: typeof first = compound;
+
+    const modifiers = {
+      limit: () => runtime.limit(1),
+      offset: () => runtime.offset(1),
+      where: () => runtime.where(unexpectedClauseCallback),
+      orderBy: () => runtime.orderBy(unexpectedClauseCallback),
+      groupBy: () => runtime.groupBy(unexpectedClauseCallback),
+      having: () => runtime.having(unexpectedClauseCallback),
+      distinct: () => runtime.distinct(),
+      select: () => runtime.select(unexpectedClauseCallback),
+      from: () => runtime.from(unexpectedClauseCallback),
+      innerJoin: () =>
+        runtime.innerJoin(unexpectedClauseCallback, unexpectedClauseCallback),
+      leftJoin: () =>
+        runtime.leftJoin(unexpectedClauseCallback, unexpectedClauseCallback),
+      rightJoin: () =>
+        runtime.rightJoin(unexpectedClauseCallback, unexpectedClauseCallback),
+      fullJoin: () =>
+        runtime.fullJoin(unexpectedClauseCallback, unexpectedClauseCallback),
+      crossJoin: () => runtime.crossJoin(unexpectedClauseCallback),
+    };
+
+    expectTypeOf<
+      Extract<keyof typeof compound, keyof typeof modifiers>
+    >().toBeNever();
+
+    for (const modify of Object.values(modifiers)) {
+      expect(modify).toThrow("Wrap the compound SELECT with .as() and from()");
+    }
+
+    const configured = compound
+      .with("available", base)
+      .$narrow<{ readonly id: number }>()
+      .$assertType<{ readonly id: number }>()
+      .$if(true, (query) => {
+        expectTypeOf<typeof query>().not.toHaveProperty("limit");
+
+        return query;
+      })
+      .when(false, (query) => {
+        expectTypeOf<typeof query>().not.toHaveProperty("limit");
+
+        return query;
+      });
+
+    expectTypeOf<typeof configured>().not.toHaveProperty("limit");
+
+    const derived = configured.as("combined");
+    const query = from(derived).orderBy(desc(derived.c.id)).limit(1);
+
+    const expected = {
+      except: [{ id: 2 }],
+      intersect: [],
+      union: [{ id: 3 }],
+      unionAll: [{ id: 3 }],
+    };
+
+    expect(
+      Effect.runSync(Effect.provideService(query, SqlClient.SqlClient, sql))
+    ).toEqual(expected[operator]);
   }
 );

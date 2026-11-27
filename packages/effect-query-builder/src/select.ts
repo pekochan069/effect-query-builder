@@ -175,13 +175,26 @@ type OperandSource<
 type SetOperand<Q extends QueryOperand, Row> = Q &
   (Types.Equals<OperandRow<Q>, Row> extends true ? unknown : never);
 
-export interface SelectQuery<
+type SelectBuilder<
   S extends Scope,
   P extends Selection,
-  N extends string = never,
-  D extends SelectDialect = SelectDialect,
-  Override = never,
-  C extends Scope = EmptyScope,
+  N extends string,
+  D extends SelectDialect,
+  Override,
+  C extends Scope,
+  Compound extends boolean,
+> = Compound extends true
+  ? SelectResult<S, P, N, D, Override, C, Compound>
+  : SelectQuery<S, P, N, D, Override, C>;
+
+interface SelectResult<
+  S extends Scope,
+  P extends Selection,
+  N extends string,
+  D extends SelectDialect,
+  Override,
+  C extends Scope,
+  Compound extends boolean,
 >
   extends
     Effect.Effect<
@@ -210,26 +223,96 @@ export interface SelectQuery<
   readonly with: <const Name extends string, Q extends QueryOperand>(
     name: Name & (Name extends keyof C ? never : unknown),
     query: Scoped<Q, C>
-  ) => SelectQuery<
+  ) => SelectBuilder<
     S,
     P,
     N,
     D & OperandDialect<Q>,
     Override,
-    C & SourceEntry<OperandSource<Name, Q>>
+    C & SourceEntry<OperandSource<Name, Q>>,
+    Compound
   >;
   readonly union: <Q extends QueryOperand>(
     query: SetOperand<Q, Result<P, N, Override>>
-  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly unionAll: <Q extends QueryOperand>(
     query: SetOperand<Q, Result<P, N, Override>>
-  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly intersect: <Q extends QueryOperand>(
     query: SetOperand<Q, Result<P, N, Override>>
-  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
   readonly except: <Q extends QueryOperand>(
     query: SetOperand<Q, Result<P, N, Override>>
-  ) => SelectQuery<S, P, N, D & OperandDialect<Q>, Override, C>;
+  ) => SelectResult<S, P, N, D & OperandDialect<Q>, Override, C, true>;
+  readonly $if: (
+    condition: boolean,
+    apply: (
+      query: SelectBuilder<S, P, N, D, Override, C, Compound>
+    ) => SelectBuilder<S, P, N, D, Override, C, Compound>
+  ) => SelectBuilder<S, P, N, D, Override, C, Compound>;
+  readonly when: (
+    condition: boolean,
+    apply: (
+      query: SelectBuilder<S, P, N, D, Override, C, Compound>
+    ) => SelectBuilder<S, P, N, D, Override, C, Compound>
+  ) => SelectBuilder<S, P, N, D, Override, C, Compound>;
+  readonly $narrow: <T extends Partial<NonNullable<Result<P, N, Override>>>>(
+    ...check: Exclude<
+      keyof T,
+      keyof NonNullable<Result<P, N, Override>>
+    > extends never
+      ? []
+      : [never]
+  ) => SelectBuilder<
+    S,
+    P,
+    N,
+    D,
+    Narrow<Result<P, N, Override>, T>,
+    C,
+    Compound
+  >;
+  readonly $assertType: <T>(
+    ...check: Types.Equals<Result<P, N, Override>, T> extends true
+      ? []
+      : [never]
+  ) => SelectBuilder<S, P, N, D, T, C, Compound>;
+  readonly compile: (
+    dialect: D & SelectionDialect<P>
+  ) => ReturnType<typeof compileSelect>;
+  readonly toFragment: (
+    dialect?: D & SelectionDialect<P>
+  ) => Statement.Fragment;
+  readonly findOne: () => Effect.Effect<
+    Result<P, N, Override>,
+    SelectError | Cause.NoSuchElementError,
+    SqlClient.SqlClient | DecodeServices<P>
+  >;
+  readonly findOneOption: () => Effect.Effect<
+    Option.Option<Result<P, N, Override>>,
+    SelectError,
+    SqlClient.SqlClient | DecodeServices<P>
+  >;
+  readonly findNonEmpty: () => Effect.Effect<
+    Arr.NonEmptyReadonlyArray<Result<P, N, Override>>,
+    SelectError | Cause.NoSuchElementError,
+    SqlClient.SqlClient | DecodeServices<P>
+  >;
+  readonly stream: () => Stream.Stream<
+    Result<P, N, Override>,
+    SelectError,
+    SqlClient.SqlClient | DecodeServices<P>
+  >;
+}
+
+export interface SelectQuery<
+  S extends Scope,
+  P extends Selection,
+  N extends string = never,
+  D extends SelectDialect = SelectDialect,
+  Override = never,
+  C extends Scope = EmptyScope,
+> extends SelectResult<S, P, N, D, Override, C, false> {
   readonly from: <const T extends Source>(
     source: Scoped<
       T & (keyof S extends never ? unknown : never) & CheckFrom<P, NoInfer<T>>,
@@ -329,57 +412,6 @@ export interface SelectQuery<
   readonly limit: (count: number) => SelectQuery<S, P, N, D, Override, C>;
   readonly offset: (count: number) => SelectQuery<S, P, N, D, Override, C>;
   readonly distinct: () => SelectQuery<S, P, N, D, Override, C>;
-  readonly $if: (
-    condition: boolean,
-    apply: (
-      query: SelectQuery<S, P, N, D, Override, C>
-    ) => SelectQuery<S, P, N, D, Override, C>
-  ) => SelectQuery<S, P, N, D, Override, C>;
-  readonly when: (
-    condition: boolean,
-    apply: (
-      query: SelectQuery<S, P, N, D, Override, C>
-    ) => SelectQuery<S, P, N, D, Override, C>
-  ) => SelectQuery<S, P, N, D, Override, C>;
-  readonly $narrow: <T extends Partial<NonNullable<Result<P, N, Override>>>>(
-    ...check: Exclude<
-      keyof T,
-      keyof NonNullable<Result<P, N, Override>>
-    > extends never
-      ? []
-      : [never]
-  ) => SelectQuery<S, P, N, D, Narrow<Result<P, N, Override>, T>, C>;
-  readonly $assertType: <T>(
-    ...check: Types.Equals<Result<P, N, Override>, T> extends true
-      ? []
-      : [never]
-  ) => SelectQuery<S, P, N, D, T, C>;
-  readonly compile: (
-    dialect: D & SelectionDialect<P>
-  ) => ReturnType<typeof compileSelect>;
-  readonly toFragment: (
-    dialect?: D & SelectionDialect<P>
-  ) => Statement.Fragment;
-  readonly findOne: () => Effect.Effect<
-    Result<P, N, Override>,
-    SelectError | Cause.NoSuchElementError,
-    SqlClient.SqlClient | DecodeServices<P>
-  >;
-  readonly findOneOption: () => Effect.Effect<
-    Option.Option<Result<P, N, Override>>,
-    SelectError,
-    SqlClient.SqlClient | DecodeServices<P>
-  >;
-  readonly findNonEmpty: () => Effect.Effect<
-    Arr.NonEmptyReadonlyArray<Result<P, N, Override>>,
-    SelectError | Cause.NoSuchElementError,
-    SqlClient.SqlClient | DecodeServices<P>
-  >;
-  readonly stream: () => Stream.Stream<
-    Result<P, N, Override>,
-    SelectError,
-    SqlClient.SqlClient | DecodeServices<P>
-  >;
 }
 
 type JoinedSource =
@@ -574,7 +606,17 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     return new Query({ ...this.#state, ...changes });
   }
 
+  #requireSimpleSelect() {
+    if (this.#state.sets.length > 0) {
+      throw new TypeError(
+        "Wrap the compound SELECT with .as() and from() to add clauses"
+      );
+    }
+  }
+
   from(input: Scoped<Source>) {
+    this.#requireSimpleSelect();
+
     if (this.#state.source !== undefined) {
       throw new TypeError("SELECT already has a FROM source");
     }
@@ -672,6 +714,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   select(selection: Scoped<Selection>) {
+    this.#requireSimpleSelect();
+
     return this.#copy({
       selection: copySelection(resolve(selection, this.#state.scope)),
     });
@@ -682,6 +726,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
     inputSource: Scoped<Source>,
     predicate: Scoped<PredicateInput>
   ) {
+    this.#requireSimpleSelect();
+
     if (this.#state.source === undefined) {
       throw new TypeError("SELECT joins require a FROM source");
     }
@@ -724,6 +770,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   crossJoin(input: Scoped<Source>) {
+    this.#requireSimpleSelect();
+
     if (this.#state.source === undefined) {
       throw new TypeError("SELECT joins require a FROM source");
     }
@@ -738,6 +786,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   where(predicate: Scoped<PredicateInput>) {
+    this.#requireSimpleSelect();
+
     const input = resolve(predicate, this.#state.scope);
     checkInput(input, this.#state.scope);
 
@@ -747,6 +797,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   having(predicate: Scoped<PredicateInput>) {
+    this.#requireSimpleSelect();
+
     const input = resolve(predicate, this.#state.scope);
     checkInput(input, this.#state.scope);
 
@@ -758,6 +810,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   groupBy(
     ...items: readonly Scoped<ExpressionInput | readonly ExpressionInput[]>[]
   ) {
+    this.#requireSimpleSelect();
+
     const nodes = items
       .flatMap((item) => resolve(item, this.#state.scope))
       .map((item) => {
@@ -770,6 +824,8 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   orderBy(...items: readonly Scoped<OrderItem | readonly OrderItem[]>[]) {
+    this.#requireSimpleSelect();
+
     const nodes = items
       .flatMap((item) => resolve(item, this.#state.scope))
       .map((item) => {
@@ -787,14 +843,20 @@ class Query extends Effectable.Class<readonly unknown[], SelectError, unknown> {
   }
 
   limit(limit: number) {
+    this.#requireSimpleSelect();
+
     return this.#copy({ limit });
   }
 
   offset(offset: number) {
+    this.#requireSimpleSelect();
+
     return this.#copy({ offset });
   }
 
   distinct() {
+    this.#requireSimpleSelect();
+
     return this.#copy({ distinct: true });
   }
 
